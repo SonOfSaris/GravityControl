@@ -1,4 +1,4 @@
-GravityControl 1.1 - arbitrary gravity direction for CONTROL Resonant
+GravityControl 1.2 - arbitrary gravity direction for CONTROL Resonant
 =====================================================================
 
 Allows free use of the Gravity Anomaly ability on-demand after acquiring it,
@@ -12,13 +12,15 @@ INSTALL
   1. Extract this archive into the game folder (next to CONTROLResonant.exe). Everything goes
      into one folder:
        crmods\GravityControl\
-  2. Upgrading from 1.0: just extract. On its first start 1.1 takes over from the old files in
-     crmods\ and renames them with .old on the end. Nothing is deleted; remove the .old files
-     when you like. Settings from the old ini are not carried over.
+  2. Upgrading from 1.1: just extract and overwrite.
+     Upgrading from 1.0: just extract. On its first start the mod takes over from the old files
+     in crmods\ and renames them with .old on the end. Nothing is deleted; remove the .old
+     files when you like. Settings from the old ini are not carried over.
   3. Start the game. Once the Gravity Anomaly ability is unlocked in your save, tap Right Shift
      or d-pad up.
-  Made for Steam build 25472515. On another game version the mod warns once at start and runs
-  anyway; if the game changed too much for it, it stays inactive and says so.
+  Checked on Steam build 25472515 and on the game update of 1 October 2026. After a later game
+  update the mod still runs if the code it needs is unchanged, and shows no message. If an
+  update stops the mod, or part of it, from working, a message at start says what is off.
 
 UNINSTALL
   Delete the crmods\GravityControl folder.

@@ -18,10 +18,12 @@ Grab `GravityControl.zip` from the [releases](../../releases) and extract it int
 the `winmm.dll` mod loader, which you already have if you run other DLL mods. Full details are in
 [README-GravityControl.txt](README-GravityControl.txt).
 
-Upgrading from 1.0: just extract. On its first start 1.1 takes over from the old flat files in
+Upgrading from 1.0: just extract. On its first start the mod takes over from the old flat files in
 `crmods\` and renames them with `.old` on the end. Nothing is deleted.
 
-Made for Steam build 25472515. On another game version the mod warns once at start and runs anyway.
+Checked on Steam build 25472515 and on the game update of 1 October 2026. After a later update the
+mod still runs if the code it needs is unchanged. It shows a message only when an update stops the
+mod, or part of it, from working.
 
 ## Build
 

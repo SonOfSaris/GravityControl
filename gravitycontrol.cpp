@@ -1,4 +1,4 @@
-// GravityControl 1.1 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515).
+// GravityControl 1.2 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515 and the 2026-10-01 update).
 //
 // How it works (see _modding-research/NOTES.md):
 //   The player's "down" is the quaternion in coregame::component::MovementPlane. The game's own
@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <share.h>
 #include <Xinput.h>
 #include <tlhelp32.h>
 #include "MinHook.h"
@@ -77,7 +78,7 @@ struct Settings {
     float rayLength = 5.f;
     float rayRadius = 0.15f;
     int diagnostics = 0;
-    int versionWarning = 1;     // 1 = message box at start when the game build differs from the tested one
+    int versionWarning = 1;     // 1 = message box at start when the mod could not hook the game, fully or partly
     int requireUnlock = 1;      // 1 = shifting needs the game's Gravity Anomaly ability unlocked
     // edge probe (used when nothing is ahead)
     float edgeAhead = 1.2f;     // metres ahead of the chest to probe for the surface past the edge
@@ -213,21 +214,42 @@ void logSettings() {
 }
 
 // ---------------------------------------------------------------- game functions
-// Byte patterns of the function prologues on build 25472515; every one is unique in .text.
-struct Anchor { const char* name; const char* pattern; uintptr_t rva; uintptr_t found; };
+// Byte patterns of function prologues; each must be found exactly once in .text. An anchor may carry the
+// pattern of more than one game build (the first that matches wins). The mod cannot run without the
+// required ones; a missing optional one only switches its part of the mod off.
+struct Anchor { const char* name; bool required; const char* patterns[2]; uintptr_t found; };
 Anchor g_anchors[] = {
-    { "mpi_body",     "4c 8b dc 4d 89 4b 20 4d 89 43 18 49 89 53 10 53 56 57 41 54 41 55 41 56 41 57 48 81 ec e0 02 00", 0x24b28e0, 0 },
-    { "start_helper", "4c 8b dc 49 89 5b 20 c5 fa 11 54 24 18 49 89 53 10 55 56 41 56 48 81 ec",                         0x24aa360, 0 },
-    { "sweep",        "4c 8b dc 49 89 5b 10 49 89 73 18 49 89 7b 20 41 54 41 56 41 57 48 81 ec 20 02 00 00 c4 c1 78 29", 0x18f82c0, 0 },
-    { "type_lookup",  "8b c2 48 8d 14 40 48 8b 81 98 01 00 00 0f b7 04 90 c3 cc cc cc cc cc cc",                         0x2ccc3b0, 0 },
-    { "uaa_body",     "48 8b c4 4c 89 48 20 4c 89 40 18 48 89 50 10 48 89 48 08 53 56 57 41 54 41 55 41 56 41 57 48 81 ec 00 03 00 00 "
+    { "mpi_body", true,
+                    { "4c 8b dc 4d 89 4b 20 4d 89 43 18 49 89 53 10 53 56 57 41 54 41 55 41 56 41 57 48 81 ec e0 02 00",
+                      nullptr }, 0 },
+    { "start_helper", true,
+                    { "4c 8b dc 49 89 5b 20 c5 fa 11 54 24 18 49 89 53 10 55 56 41 56 48 81 ec",
+                      nullptr }, 0 },
+    { "sweep", true,
+                    { "4c 8b dc 49 89 5b 10 49 89 73 18 49 89 7b 20 41 54 41 56 41 57 48 81 ec 20 02 00 00 c4 c1 78 29",
+                      nullptr }, 0 },
+    { "type_lookup", false,
+                    { "8b c2 48 8d 14 40 48 8b 81 98 01 00 00 0f b7 04 90 c3 cc cc cc cc cc cc",
+                      nullptr }, 0 },
+    { "uaa_body", true,
+                    { "48 8b c4 4c 89 48 20 4c 89 40 18 48 89 50 10 48 89 48 08 53 56 57 41 54 41 55 41 56 41 57 48 81 ec 00 03 00 00 "
                       "c5 f8 29 70 b8 c5 f8 29 78 a8 c5 78 29 40 98 c5 78 29 48 88 c5 78 29 90 78 ff ff ff c5 78 29 98 68 ff ff ff "
                       "c5 78 29 a0 58 ff ff ff c5 78 29 a8 48 ff ff ff c5 78 29 b0 38 ff ff ff c5 78 29 b8 28 ff ff ff 4d 8b f8 48 8b d9 "
-                      "c5 fc 10 09 c5 fc 11 88 08 fe ff ff c5 fc 10 51 20",                                                       0x24ae0c0, 0 },
-    { "ability_unlocked", "40 57 48 83 ec 30 4c 8b 09 48 8b fa 8b 41 08 48 8d 04 40 48 c1 e0 05 49 03 c1 4c 3b c8 74 10 90 45",     0x2939e10, 0 },
-    { "menu_broadcast", "48 89 5c 24 10 56 48 83 ec 30 80 7a 38 00 49 8b f0 48 8b da 0f 84 a2 00 00 00 48 8d 4c 24 20",           0x1ff6470, 0 },
+                      "c5 fc 10 09 c5 fc 11 88 08 fe ff ff c5 fc 10 51 20",
+                      nullptr }, 0 },
+    { "ability_unlocked", false,
+                    { "40 57 48 83 ec 30 4c 8b 09 48 8b fa 8b 41 08 48 8d 04 40 48 c1 e0 05 49 03 c1 4c 3b c8 74 10 90 45",
+                      "48 83 ec 28 8b 41 08 4c 8b ca 48 8b 11 48 8d 04 40 48 c1 e0 05 48 03 c2 48 3b d0 74 12 0f 1f 00 44 38 42 05 74 10 48 83 c2 60" }, 0 },      // build 25472515, then the 2026-10-01 update
+    { "menu_broadcast", false,
+                    { "48 89 5c 24 10 56 48 83 ec 30 80 7a 38 00 49 8b f0 48 8b da 0f 84 a2 00 00 00 48 8d 4c 24 20",
+                      nullptr }, 0 },
+    // bool layersCollide(a, b): ends in "lea rdx, [rip + matrix]"; the pattern stops at that lea (+59)
+    { "layer_check", false,
+                    { "8b 41 04 85 c0 74 1d 3b 42 04 75 18 8b 41 08 85 c0 74 0e 44 8b 42 08 45 85 c0 74 05 44 85 c0 74 03 32 c0 c3 "
+                      "44 8b 02 8b 11 41 f7 d0 f7 d2 41 8b c8 41 3b d0 44 0f 47 c2 0f 42 ca 48 8d 15",
+                      nullptr }, 0 },
 };
-enum { A_MPI = 0, A_START, A_SWEEP, A_TYPE, A_UAA, A_UNLOCK, A_MENU };
+enum { A_MPI = 0, A_START, A_SWEEP, A_TYPE, A_UAA, A_UNLOCK, A_MENU, A_LAYERS };
 
 // void start(const Quat* target, uint64 entity, float durationOverride, uint8 linear,
 //            void* playerAnomalyComponentRow, Quat* movementPlane, uint8* mpiRow, uint8* cameraRow)
@@ -420,7 +442,7 @@ void applyTarget(const Quat& q, void* pac, Quat* plane, uint8_t* mpi, const char
 }
 
 // ---------------------------------------------------------------- blockers (layer matrix)
-uint64_t* g_matrix = nullptr;        // physics layer collision matrix: 64 rows of 64 bits (exe + 0x5d1fd50, build-specific)
+uint64_t* g_matrix = nullptr;        // physics layer collision matrix: 64 rows of 64 bits; found through the layer_check anchor
 bool readable(const void* p, size_t n) {
     MEMORY_BASIC_INFORMATION mbi;
     if (!p || VirtualQuery(p, &mbi, sizeof mbi) != sizeof mbi) return false;
@@ -468,7 +490,7 @@ int anomalyUnlocked() {
 }
 
 void requestShift(uint8_t (*b)[32], void* scene) {
-    if (g_cfg.requireUnlock) {
+    if (g_cfg.requireUnlock && g_isUnlocked) {
         int u = anomalyUnlocked();
         if (u < 0) { logf("shift refused: cannot check the Gravity Anomaly unlock yet (the game's anomaly update has not run)"); return; }
         if (u == 0) { logf("shift refused: the Gravity Anomaly ability (id %d) is not unlocked in this save", kAbilityId); return; }
@@ -739,29 +761,68 @@ uintptr_t findPattern(const uint8_t* base, size_t size, const std::string& bytes
     return first;
 }
 
-const DWORD kTestedBuildStamp = 0x6AB107A0;   // Steam build 25472515
-bool g_buildMatch = false;
-bool resolveAnchors() {
-    HMODULE exe = GetModuleHandleW(nullptr);
-    auto* dos = (IMAGE_DOS_HEADER*)exe;
-    auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)exe + dos->e_lfanew);
-    g_buildMatch = nt->FileHeader.TimeDateStamp == kTestedBuildStamp;
-    logf("exe %p timestamp 0x%08X (tested build: 0x%08X) %s", exe, nt->FileHeader.TimeDateStamp, kTestedBuildStamp, g_buildMatch ? "match" : "DIFFERENT: trying anyway");
-    g_matrix = (uint64_t*)((uint8_t*)exe + 0x5d1fd50);
-    auto* sec = IMAGE_FIRST_SECTION(nt);
-    const uint8_t* text = nullptr; size_t textSize = 0; uintptr_t textRva = 0;
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        if (memcmp(sec[i].Name, ".text", 5) == 0) { text = (uint8_t*)exe + sec[i].VirtualAddress; textSize = sec[i].Misc.VirtualSize; textRva = sec[i].VirtualAddress; break; }
+// Game builds this version was checked on, by PE timestamp. Any other build is tried all the same: the
+// patterns decide whether the mod can run, not the timestamp.
+const DWORD kKnownBuilds[] = { 0x6AB107A0,      // Steam build 25472515
+                               0x6ABA5BB8 };    // update of 2026-10-01 (changelist 5642085)
+bool g_buildKnown = false;
+
+// The image the anchors are looked up in: this process's exe. A test can name a game exe to map as data
+// instead (GRAVITYCONTROL_TEST_IMAGE), which checks the patterns and the hook creation against real code.
+HMODULE gameImage() {
+    static HMODULE img = nullptr;
+    if (!img) {
+        wchar_t path[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(L"GRAVITYCONTROL_TEST_IMAGE", path, MAX_PATH);
+        if (n && n < MAX_PATH) img = LoadLibraryExW(path, nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (!img) img = GetModuleHandleW(nullptr);
     }
-    if (!text) { logf("FAIL: no .text section"); return false; }
+    return img;
+}
+
+bool textSection(const uint8_t*& text, size_t& size) {
+    HMODULE exe = gameImage();
+    auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (memcmp(sec[i].Name, ".text", 5) == 0) { text = (uint8_t*)exe + sec[i].VirtualAddress; size = sec[i].Misc.VirtualSize; return true; }
+    return false;
+}
+
+// Looks every anchor up. Returns false when a required one is missing; a missing optional one just stays 0.
+bool resolveAnchors() {
+    HMODULE exe = gameImage();
+    auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    DWORD stamp = nt->FileHeader.TimeDateStamp;
+    for (DWORD b : kKnownBuilds) if (b == stamp) g_buildKnown = true;
+    logf("game image %p, build timestamp 0x%08X: %s", exe, stamp,
+         g_buildKnown ? "a build this version was checked on" : "not a build this version knows, trying anyway");
+    const uint8_t* text = nullptr; size_t textSize = 0;
+    if (!textSection(text, textSize)) { logf("FAIL: no .text section"); return false; }
     bool ok = true;
     for (auto& a : g_anchors) {
-        std::string b, m; parsePattern(a.pattern, b, m);
-        int count = 0; uintptr_t off = findPattern(text, textSize, b, m, count);
-        if (count != 1) { logf("FAIL: anchor %s found %d times (game build changed?)", a.name, count); ok = false; continue; }
-        a.found = (uintptr_t)text + off;
-        logf("anchor %s at rva 0x%llx (expected 0x%llx) %s", a.name, (unsigned long long)(textRva + off), (unsigned long long)a.rva,
-             (textRva + off) == a.rva ? "match" : "MOVED");
+        int most = 0, which = 0;
+        for (const char* pat : a.patterns) {
+            if (!pat) continue;
+            which++;
+            std::string b, m; parsePattern(pat, b, m);
+            int count = 0; uintptr_t off = findPattern(text, textSize, b, m, count);
+            if (count == 1) { a.found = (uintptr_t)text + off; break; }
+            if (count > most) most = count;
+        }
+        if (a.found) logf("anchor %s at rva 0x%llx (pattern %d)", a.name, (unsigned long long)(a.found - (uintptr_t)exe), which);
+        else {
+            logf("FAIL: %s anchor %s not found (%d matches); the game code changed", a.required ? "required" : "optional", a.name, most);
+            if (a.required) ok = false;
+        }
+    }
+    if (g_anchors[A_LAYERS].found) {
+        const uint8_t* lea = (const uint8_t*)g_anchors[A_LAYERS].found + 59;     // lea rdx, [rip + matrix]
+        int32_t disp; memcpy(&disp, lea + 3, 4);
+        g_matrix = (uint64_t*)(lea + 7 + disp);
+        uintptr_t lo = (uintptr_t)exe, hi = lo + nt->OptionalHeader.SizeOfImage;
+        if ((uintptr_t)g_matrix < lo || (uintptr_t)g_matrix + 64 * 8 > hi) g_matrix = nullptr;      // must lie inside the game image
+        else logf("layer matrix at rva 0x%llx", (unsigned long long)((uintptr_t)g_matrix - lo));
     }
     return ok;
 }
@@ -829,15 +890,6 @@ bool hookedBy(const uint8_t* site, uintptr_t base, size_t size) {
     return disp == 0 && target >= base && target < base + size;
 }
 
-bool textSection(const uint8_t*& text, size_t& size) {
-    HMODULE exe = GetModuleHandleW(nullptr);
-    auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
-    auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
-        if (memcmp(sec[i].Name, ".text", 5) == 0) { text = (uint8_t*)exe + sec[i].VirtualAddress; size = sec[i].Misc.VirtualSize; return true; }
-    return false;
-}
-
 // An older copy is loaded: wait until it has finished starting, then put the original bytes back where it
 // hooked the game. Its hook functions are never reached again, so it stays loaded but does nothing, and
 // this copy hooks the untouched functions as usual. This runs while the game is still starting up.
@@ -851,7 +903,7 @@ void takeOver(const OtherCopy& old) {
     int removed = 0;
     for (int id : hooked) {
         const Anchor& a = g_anchors[id];
-        std::string b, m; parsePattern(a.pattern, b, m);
+        std::string b, m; parsePattern(a.patterns[0], b, m);
         // the hook overwrote the first 5 bytes: find the function by the rest of its pattern
         int count = 0; uintptr_t off = findPattern(text + 5, textSize - 5, b.substr(5), m.substr(5), count);
         if (count != 1) { logf("takeover: %s not found (%d matches)", a.name, count); continue; }
@@ -931,6 +983,20 @@ DWORD WINAPI xinputThread(LPVOID) {
     }
 }
 
+const wchar_t kStopMessage[] = L"To stop this message, set VersionWarning=0 in gravitycontrol_config.ini, or switch it off under Options > MODS.";
+
+// The mod cannot run in this game build: say so (unless told not to) and leave the process.
+DWORD standDown(const char* why) {
+    logf("GravityControl inactive: %s; the game runs unmodified", why);
+    if (g_cfg.versionWarning && dialogs()) {
+        std::wstring msg = L"GravityControl could not hook this version of the game, so it is switched off. The game itself is not affected.\n\n"
+                           L"A game update probably changed the code the mod relies on. Look for a newer version of GravityControl.\n\n"
+                           L"Details are in gravitycontrol.log, next to the mod. ";
+        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    }
+    return unloadSelf();
+}
+
 DWORD WINAPI initThread(LPVOID) {
     loadSettings();
     logSettings();
@@ -943,17 +1009,8 @@ DWORD WINAPI initThread(LPVOID) {
     }
     for (const OtherCopy& old : copies.legacy) takeOver(old);
     retireFlatInstall();
-    bool anchorsOk = resolveAnchors();
-    if (!g_buildMatch && g_cfg.versionWarning && dialogs()) {
-        MessageBoxW(nullptr,
-            anchorsOk ? L"Your game version is different from the one this version of GravityControl was made for, so there might be issues.\n\n"
-                        L"To turn this warning off, set VersionWarning=0 in gravitycontrol_config.ini, or switch it off under Options > MODS."
-                      : L"Your game version is different from the one this version of GravityControl was made for, and the mod could not find its hook points in it.\n\n"
-                        L"GravityControl stays inactive until it is updated. Details are in gravitycontrol.log, next to the mod.",
-            L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
-    }
-    if (!anchorsOk) { logf("GravityControl inactive: anchors missing, the game runs unmodified"); return unloadSelf(); }
-    if (MH_Initialize() != MH_OK) { logf("FAIL: MinHook init"); return unloadSelf(); }
+    if (!resolveAnchors()) return standDown("a hook point it needs was not found in this game build");
+    if (MH_Initialize() != MH_OK) return standDown("the hooking library did not start");
     {
         HMODULE xi = LoadLibraryW(L"xinput1_4.dll");
         if (!xi) xi = LoadLibraryW(L"xinput9_1_0.dll");
@@ -961,19 +1018,46 @@ DWORD WINAPI initThread(LPVOID) {
         logf("controller: %s; PlayStation pads are read over HID", g_xinputGetState ? "XInput ready" : "XInput not available");
     }
     g_sweep = (SweepFn)g_anchors[A_SWEEP].found;
-    g_typeLookup = (TypeLookupFn)g_anchors[A_TYPE].found;
-    g_isUnlocked = (UnlockFn)g_anchors[A_UNLOCK].found;
+    g_typeLookup = (TypeLookupFn)g_anchors[A_TYPE].found;          // optional: without it only the player's own entity id is filtered
+    g_isUnlocked = (UnlockFn)g_anchors[A_UNLOCK].found;            // optional: without it the unlock gate cannot be checked
     const char* failed = nullptr;
     if (MH_CreateHook((void*)g_anchors[A_START].found, (void*)hkStart, (void**)&g_origStart) != MH_OK) failed = "start_helper";
     else if (MH_CreateHook((void*)g_anchors[A_MPI].found, (void*)hkBody, (void**)&g_origBody) != MH_OK) failed = "mpi_body";
     else if (MH_CreateHook((void*)g_anchors[A_UAA].found, (void*)hkUaa, (void**)&g_origUaa) != MH_OK) failed = "uaa_body";
-    else if (MH_CreateHook((void*)g_anchors[A_MENU].found, (void*)hkMenu, (void**)&g_origMenu) != MH_OK) failed = "menu_broadcast";
-    if (failed) { logf("FAIL: hook %s", failed); MH_Uninitialize(); return unloadSelf(); }
-    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) { logf("FAIL: enable hooks"); return 0; }
+    if (failed) { logf("FAIL: hook %s", failed); MH_Uninitialize(); return standDown("a hook could not be created"); }
+    bool menuHook = g_anchors[A_MENU].found &&
+                    MH_CreateHook((void*)g_anchors[A_MENU].found, (void*)hkMenu, (void**)&g_origMenu) == MH_OK;   // optional
+    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+        // some hooks may already be live, so this copy stays loaded
+        logf("FAIL: enable hooks; GravityControl may not work in this session");
+        if (g_cfg.versionWarning && dialogs())
+            MessageBoxW(nullptr, (std::wstring(L"GravityControl could not switch its hooks on in this version of the game and may not work.\n\n"
+                                               L"Details are in gravitycontrol.log, next to the mod. ") + kStopMessage).c_str(),
+                        L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+        return 0;
+    }
     CreateThread(nullptr, 0, hidThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, xinputThread, nullptr, 0, nullptr);
-    logf("active: GravityControl 1.1 - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
+    logf("active: GravityControl 1.2 - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
          g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0);
+    // Parts that had to be left out in this game build. Only the ones a player would notice get a message.
+    std::wstring off;
+    if (!g_isUnlocked) {
+        logf("reduced: the Gravity Anomaly unlock check is unavailable; RequireAnomalyUnlocked cannot be enforced, shifting is allowed");
+        off += L"  - the Gravity Anomaly unlock check: gravity can be shifted before the ability is unlocked\n";
+    }
+    if (!menuHook) {
+        logf("reduced: the game-menu state is unavailable; the key and button are not ignored while a menu is open");
+        off += L"  - ignoring the key and button while a game menu is open\n";
+    }
+    if (!g_typeLookup) logf("reduced: the physics layer lookup is unavailable; the ray filters the player by entity id only");
+    if (!g_matrix) logf("reduced: the layer matrix was not found; [Blockers] IgnoreLayers does nothing");
+    if (off.empty()) logf(g_buildKnown ? "all hook points found" : "all hook points found in a game build this version does not know: no message is shown");
+    else if (g_cfg.versionWarning && dialogs()) {
+        std::wstring msg = L"GravityControl is running, but this version of the game changed some of the code it relies on. Switched off:\n\n" + off +
+                           L"\nEverything else works. Look for a newer version of GravityControl.\n\n";
+        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    }
     return 0;
 }
 
@@ -1075,8 +1159,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         g_dir = path; size_t p = g_dir.find_last_of(L"\\/"); g_dir = g_dir.substr(0, p + 1);
         InitializeCriticalSection(&g_logLock);
         g_t0 = GetTickCount();
-        _wfopen_s(&g_log, (g_dir + L"gravitycontrol.log").c_str(), L"w");
-        logf("GravityControl 1.1 loading from %ls", g_dir.c_str());
+        g_log = _wfsopen((g_dir + L"gravitycontrol.log").c_str(), L"w", _SH_DENYWR);   // readable while the game runs
+        logf("GravityControl 1.2 loading from %ls", g_dir.c_str());
         CreateThread(nullptr, 0, initThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         logf(reserved ? "game exiting" : "unloaded");

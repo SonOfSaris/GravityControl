@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "gravitycontrol",
   "name": "GravityControl",
-  "version": "1.1",
+  "version": "1.2",
   "dll": "gravitycontrol.dll",
   "options": [
     {"id": "enabled", "type": "toggle", "default": true,
@@ -48,8 +48,8 @@
      "label": "Edge probe: floor tolerance (cm)",
      "description": "Ground this close to your own floor level counts as the floor continuing, not as an edge."},
     {"id": "version_warning", "type": "toggle", "default": true,
-     "label": "Game version warning",
-     "description": "Warns at start when the game version differs from the one this mod was made for."},
+     "label": "Warn when the mod cannot start",
+     "description": "Shows a message at start when a game update stops the mod, or part of it, from working. A game update that changes nothing the mod needs shows no message."},
     {"id": "diagnostics", "type": "toggle", "default": false,
      "label": "Diagnostics",
      "description": "Writes extra detail to gravitycontrol.log."}

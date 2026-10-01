@@ -1,6 +1,15 @@
 GravityControl changelog
 ========================
 
+1.2   Works on the game update of 1 October 2026 (1.1 went inactive there: the game's unlock check was
+      rebuilt and one lookup pattern no longer matched). Build 25472515 is still supported.
+      Game updates: no message any more just because the build is different. A message appears
+      only when the mod could not hook the game, and it says whether the mod is off or which part
+      is off. The unlock check, the menu-open check and the two blocker lookups are optional now:
+      if an update breaks one, the rest of the mod keeps working. Without the unlock check,
+      shifting is allowed (RequireAnomalyUnlocked cannot be enforced).
+      The [Blockers] layer matrix is located from the game code instead of a fixed address.
+      The log can be opened while the game runs.
 1.1   PlayStation controllers: DualSense, DualSense Edge and DualShock 4 are read directly over HID
       (USB and Bluetooth), so the pad button works without Steam Input. All four XInput slots are
       polled, and every pad feeds one button state.
