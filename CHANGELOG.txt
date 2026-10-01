@@ -1,6 +1,18 @@
 GravityControl changelog
 ========================
 
+1.1   PlayStation controllers: DualSense, DualSense Edge and DualShock 4 are read directly over HID
+      (USB and Bluetooth), so the pad button works without Steam Input. All four XInput slots are
+      polled, and every pad feeds one button state.
+      Mod Settings Menu support (gravitycontrol.menu.json): Options > MODS > GravityControl shows
+      the version and whether the mod is running, an Enable switch and the ini settings. Values
+      saved by the menu (ModMenuConfig\gravitycontrol.ini) win over the ini. New [General] Enabled.
+      The mod lives in its own folder, crmods\GravityControl\, and replaces a 1.0 install by itself:
+      a loaded 1.0 copy gets its hooks removed and 1.1 takes over in the same session, and the flat
+      1.0 files in crmods\ are renamed with .old on the end (nothing is deleted).
+      It unloads itself when it cannot hook the game, so the menu never shows a dead mod as running.
+      Default ray length 5 m (was 10). No longer settings (fixed in the mod): AnomalyAbilityId,
+      BlockInMenus, ChestHeight, UpwardRay, PlayerLayer.
 1.0   Release. Keyboard: Right Shift (tap = shift, hold = reset). On a different game build the mod
       warns once at start (VersionWarning) and runs anyway. Shorter ini comments and readme.
       Release. The mod is now called GravityControl: gravitycontrol.dll, gravitycontrol_config.ini,

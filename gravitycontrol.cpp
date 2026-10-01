@@ -1,4 +1,4 @@
-// GravityControl 1.0 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515).
+// GravityControl 1.1 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515).
 //
 // How it works (see _modding-research/NOTES.md):
 //   The player's "down" is the quaternion in coregame::component::MovementPlane. The game's own
@@ -11,8 +11,10 @@
 //   update_active_anomaly); the start helper is hooked too, so the game's own calls can be held
 //   off while we own the plane.
 //
-// Loads through crloader (crmods\gravitycontrol.dll). Settings: gravitycontrol_config.ini next to the
-// DLL. Log: gravitycontrol.log next to the DLL.
+// Loads through crloader (crmods\GravityControl\gravitycontrol.dll). Next to the DLL: the settings in
+// gravitycontrol_config.ini, the log in gravitycontrol.log, and gravitycontrol.menu.json, which puts the
+// settings on the Options > MODS page of Mod Settings Menu (what the player changes there lands in
+// ModMenuConfig\gravitycontrol.ini and wins over the ini).
 
 #include <windows.h>
 #include <cstdint>
@@ -21,8 +23,11 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <Xinput.h>
+#include <tlhelp32.h>
 #include "MinHook.h"
+#include "sonypad.h"
 
 namespace {
 
@@ -66,29 +71,25 @@ Quat fromTo(Vec a, Vec b, Vec fallbackAxis) {
 
 // ---------------------------------------------------------------- settings / log
 struct Settings {
+    int enabled = 1;            // 0 = the mod does nothing (and gravity goes back to normal)
     int keyShift = VK_RSHIFT;   // tap = shift, hold HoldSeconds = reset (like the pad button)
     float keyHoldSeconds = 1.f;
-    float rayLength = 10.f;
+    float rayLength = 5.f;
     float rayRadius = 0.15f;
-    float chestHeight = 1.2f;
-    int upRay = 1;              // 1 = also look straight up; the closer of the two hits wins
     int diagnostics = 0;
     int versionWarning = 1;     // 1 = message box at start when the game build differs from the tested one
-    int blockInMenus = 1;       // 1 = the keys/pad do nothing while one of the game's menus is open
     int requireUnlock = 1;      // 1 = shifting needs the game's Gravity Anomaly ability unlocked
-    int abilityId = 7;          // Gravity Anomaly in the ability database (the game's own anomaly scan checks id 7)
     // edge probe (used when nothing is ahead)
     float edgeAhead = 1.2f;     // metres ahead of the chest to probe for the surface past the edge
     float edgeDepth = 2.5f;     // how far below floor level the down probe reaches
-    float floorTol = 0.35f;     // a down hit within chestHeight + this is "floor continues"
+    float floorTol = 0.35f;     // a down hit within the ray height + this is "floor continues"
     float snapDeg = 15.f;       // snap the new up to a world axis when within this angle (0 = off)
     int axisOnly = 1;           // 1 = the new up is always the nearest world axis
     // controller
     int padEnabled = 1;
-    int padButton = XINPUT_GAMEPAD_DPAD_UP;
+    int padButton = XINPUT_GAMEPAD_DPAD_UP;   // XInput wButtons mask; 0x10000 = LT / L2, 0x20000 = RT / R2; 0 = none
     float padHoldSeconds = 1.f;
     // blockers: collision-matrix bits (PlayerLayer, L) cleared so the player's capsule ignores layer L
-    int playerLayer = 8;
     int ignoreLayers[8] = {}; int nIgnore = 0;
 } g_cfg;
 
@@ -102,6 +103,12 @@ const int kOffHit = 0x70, kOffEntity = 0x14, kOffDistance = 0x20, kOffPosition =
 const float kDurationOverride = -1.f;
 const uint8_t kLinear = 0;
 const uint64_t kPivot = 0;
+// Settings until 1.1, fixed since: the ray starts 1.2 m above the feet, Gravity Anomaly is ability 7 in the
+// ability database (the id the game's own anomaly scan checks) and the player's capsule is physics layer 8.
+// A second ray always looks straight up, and inputs are always ignored while a game menu is open.
+const float kChestHeight = 1.2f;
+const int kAbilityId = 7;
+const int kPlayerLayer = 8;
 
 std::wstring g_dir;      // folder of this DLL, with trailing backslash
 FILE* g_log = nullptr;
@@ -134,29 +141,75 @@ void iniList(const wchar_t* sec, const wchar_t* key, int* out, int& n, int cap, 
     while (*q && n < cap) { wchar_t* e; long v = wcstol(q, &e, 0); if (e == q) { q++; continue; } out[n++] = (int)v; q = e; }
 }
 
+// Mod Settings Menu pad codes are 256 + n, n in this order: A B X Y LB RB LT RT Back Start L3 R3 Up Down
+// Left Right. The same buttons as masks (XInput bits, the triggers above them):
+const uint32_t kMenuPad[16] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200, sonypad::kLT, sonypad::kRT,
+                                0x0020, 0x0010, 0x0040, 0x0080, 0x0001, 0x0002, 0x0004, 0x0008 };
+int g_menuValues = 0;    // how many settings the MODS menu supplied on the last load
+
+// Mod Settings Menu saves what the player changes on Options > MODS as numbers under [Settings] in
+// ModMenuConfig\<id>.ini, in the folder of the descriptor (gravitycontrol.menu.json, next to this DLL).
+bool menuNum(const wchar_t* key, double& v, const std::wstring& file) {
+    wchar_t buf[64]; GetPrivateProfileStringW(L"Settings", key, L"", buf, 64, file.c_str());
+    if (!buf[0]) return false;
+    if (!_wcsicmp(buf, L"true")) { v = 1; return true; }
+    if (!_wcsicmp(buf, L"false")) { v = 0; return true; }
+    wchar_t* e = nullptr; v = wcstod(buf, &e);
+    return e != buf;
+}
+float clampf(double v, double lo, double hi) { return (float)(v < lo ? lo : v > hi ? hi : v); }
+
+// A value saved by the menu wins over the ini; a setting the menu never saved keeps its ini value.
+int applyMenu(Settings& c) {
+    std::wstring f = g_dir + L"ModMenuConfig\\gravitycontrol.ini";
+    if (GetFileAttributesW(f.c_str()) == INVALID_FILE_ATTRIBUTES) return 0;
+    int n = 0; double v;
+    if (menuNum(L"enabled", v, f))            { c.enabled = v != 0; n++; }
+    if (menuNum(L"key", v, f))                { int k = (int)v; if (k == 0 || (k >= 3 && k <= 254)) { c.keyShift = k; n++; } }
+    if (menuNum(L"pad_button", v, f))         { int k = (int)v; if (k == 0) { c.padButton = 0; n++; } else if (k >= 256 && k < 272) { c.padButton = (int)kMenuPad[k - 256]; n++; } }
+    if (menuNum(L"hold_ms", v, f))            { c.keyHoldSeconds = c.padHoldSeconds = clampf(v, 100, 5000) / 1000.f; n++; }
+    if (menuNum(L"ray_length", v, f))         { c.rayLength = clampf(v, 1, 100); n++; }
+    if (menuNum(L"axis_only", v, f))          { c.axisOnly = v != 0; n++; }
+    if (menuNum(L"require_unlock", v, f))     { c.requireUnlock = v != 0; n++; }
+    if (menuNum(L"snap_degrees", v, f))       { c.snapDeg = clampf(v, 0, 90); n++; }
+    if (menuNum(L"ray_radius_cm", v, f))      { c.rayRadius = clampf(v, 1, 100) / 100.f; n++; }
+    if (menuNum(L"edge_ahead_cm", v, f))      { c.edgeAhead = clampf(v, 10, 1000) / 100.f; n++; }
+    if (menuNum(L"edge_depth_cm", v, f))      { c.edgeDepth = clampf(v, 10, 2000) / 100.f; n++; }
+    if (menuNum(L"floor_tolerance_cm", v, f)) { c.floorTol = clampf(v, 0, 300) / 100.f; n++; }
+    if (menuNum(L"version_warning", v, f))    { c.versionWarning = v != 0; n++; }
+    if (menuNum(L"diagnostics", v, f))        { c.diagnostics = v != 0; n++; }
+    return n;
+}
+
 void loadSettings() {
+    Settings c;                               // from the defaults every time: a line removed from a file goes back to its default
     std::wstring f = g_dir + L"gravitycontrol_config.ini";
-    g_cfg.keyShift   = iniInt(L"Keys", L"Shift", g_cfg.keyShift, f);
-    g_cfg.keyHoldSeconds = iniFloat(L"Keys", L"HoldSeconds", g_cfg.keyHoldSeconds, f);
-    g_cfg.rayLength  = iniFloat(L"Ray", L"Length", g_cfg.rayLength, f);
-    g_cfg.rayRadius  = iniFloat(L"Ray", L"Radius", g_cfg.rayRadius, f);
-    g_cfg.chestHeight= iniFloat(L"Ray", L"ChestHeight", g_cfg.chestHeight, f);
-    g_cfg.upRay      = iniInt(L"Ray", L"UpwardRay", g_cfg.upRay, f);
-    g_cfg.diagnostics= iniInt(L"General", L"Diagnostics", g_cfg.diagnostics, f);
-    g_cfg.requireUnlock = iniInt(L"General", L"RequireAnomalyUnlocked", g_cfg.requireUnlock, f);
-    g_cfg.blockInMenus = iniInt(L"General", L"BlockInMenus", g_cfg.blockInMenus, f);
-    g_cfg.versionWarning = iniInt(L"General", L"VersionWarning", g_cfg.versionWarning, f);
-    g_cfg.abilityId  = iniInt(L"General", L"AnomalyAbilityId", g_cfg.abilityId, f);
-    g_cfg.edgeAhead  = iniFloat(L"Edge", L"Ahead", g_cfg.edgeAhead, f);
-    g_cfg.edgeDepth  = iniFloat(L"Edge", L"Depth", g_cfg.edgeDepth, f);
-    g_cfg.floorTol   = iniFloat(L"Edge", L"FloorTolerance", g_cfg.floorTol, f);
-    g_cfg.snapDeg    = iniFloat(L"Edge", L"SnapDegrees", g_cfg.snapDeg, f);
-    g_cfg.axisOnly   = iniInt(L"Edge", L"AxisOnly", g_cfg.axisOnly, f);
-    g_cfg.padEnabled = iniInt(L"Controller", L"Enabled", g_cfg.padEnabled, f);
-    g_cfg.padButton  = iniInt(L"Controller", L"Button", g_cfg.padButton, f);
-    g_cfg.padHoldSeconds = iniFloat(L"Controller", L"HoldSeconds", g_cfg.padHoldSeconds, f);
-    g_cfg.playerLayer = iniInt(L"Blockers", L"PlayerLayer", g_cfg.playerLayer, f);
-    iniList(L"Blockers", L"IgnoreLayers", g_cfg.ignoreLayers, g_cfg.nIgnore, 8, f);
+    c.enabled    = iniInt(L"General", L"Enabled", c.enabled, f);
+    c.keyShift   = iniInt(L"Keys", L"Shift", c.keyShift, f);
+    c.keyHoldSeconds = iniFloat(L"Keys", L"HoldSeconds", c.keyHoldSeconds, f);
+    c.rayLength  = iniFloat(L"Ray", L"Length", c.rayLength, f);
+    c.rayRadius  = iniFloat(L"Ray", L"Radius", c.rayRadius, f);
+    c.diagnostics= iniInt(L"General", L"Diagnostics", c.diagnostics, f);
+    c.requireUnlock = iniInt(L"General", L"RequireAnomalyUnlocked", c.requireUnlock, f);
+    c.versionWarning = iniInt(L"General", L"VersionWarning", c.versionWarning, f);
+    c.edgeAhead  = iniFloat(L"Edge", L"Ahead", c.edgeAhead, f);
+    c.edgeDepth  = iniFloat(L"Edge", L"Depth", c.edgeDepth, f);
+    c.floorTol   = iniFloat(L"Edge", L"FloorTolerance", c.floorTol, f);
+    c.snapDeg    = iniFloat(L"Edge", L"SnapDegrees", c.snapDeg, f);
+    c.axisOnly   = iniInt(L"Edge", L"AxisOnly", c.axisOnly, f);
+    c.padEnabled = iniInt(L"Controller", L"Enabled", c.padEnabled, f);
+    c.padButton  = iniInt(L"Controller", L"Button", c.padButton, f);
+    c.padHoldSeconds = iniFloat(L"Controller", L"HoldSeconds", c.padHoldSeconds, f);
+    iniList(L"Blockers", L"IgnoreLayers", c.ignoreLayers, c.nIgnore, 8, f);
+    g_menuValues = applyMenu(c);
+    g_cfg = c;
+}
+
+void logSettings() {
+    logf("settings: Enabled=%d Key=0x%X PadButton=0x%X Hold=%.1f/%.1f Length=%.1f Radius=%.2f AxisOnly=%d RequireUnlock=%d Diag=%d (%d from the MODS menu)",
+         g_cfg.enabled, g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0, g_cfg.keyHoldSeconds, g_cfg.padHoldSeconds,
+         g_cfg.rayLength, g_cfg.rayRadius, g_cfg.axisOnly, g_cfg.requireUnlock, g_cfg.diagnostics, g_menuValues);
+    if (g_cfg.nIgnore) logf("blockers: IgnoreLayers count=%d (player layer %d)", g_cfg.nIgnore, kPlayerLayer);
 }
 
 // ---------------------------------------------------------------- game functions
@@ -204,6 +257,10 @@ UnlockFn g_isUnlocked = nullptr;
 MenuFn g_origMenu = nullptr;
 typedef DWORD (WINAPI *XInputGetStateFn)(DWORD, XINPUT_STATE*);
 XInputGetStateFn g_xinputGetState = nullptr;
+std::atomic<uint32_t> g_hidButtons{ 0 };   // PlayStation pads read over HID (sonypad.h), in the XInput button layout
+std::atomic<uint32_t> g_xiSlots{ 0 };      // XInput slots that have a pad, found by xinputThread
+HMODULE g_self = nullptr;
+HANDLE g_instanceMutex = nullptr;            // held while this copy is the one in charge
 
 // ---------------------------------------------------------------- state (game thread only)
 struct State {
@@ -217,8 +274,8 @@ struct State {
     uint8_t* menuState = nullptr; DWORD menuTick = 0; int menuOpenLast = -1; DWORD menuIgnoreLog = 0;
     unsigned startCalls = 0, bodyCalls = 0, uaaCalls = 0, dropped = 0;
     bool keyShiftDown = false, keyConsumed = false; DWORD keyDownAt = 0;
-    bool padDown = false, padConsumed = false; DWORD padDownAt = 0, padRetryAt = 0;
-    DWORD lastCfgCheck = 0; FILETIME cfgTime{};
+    bool padDown = false, padConsumed = false; DWORD padDownAt = 0;
+    DWORD lastCfgCheck = 0; FILETIME cfgTime{}, menuCfgTime{}; int enabledLast = -1;
 } g_s;
 
 const Quat kIdentity{ 0, 0, 0, 1 };
@@ -272,7 +329,7 @@ void hkMenu(void* ent, uint8_t* state, void* world) {
     int open = state[0x54] ? 1 : 0;
     if (open != g_s.menuOpenLast) {
         char nm[40]; menuName(state, nm, sizeof nm);
-        if (open) logf("menu opened: [%s] (shift/reset %s)", nm, g_cfg.blockInMenus ? "blocked" : "still allowed, BlockInMenus=0");
+        if (open) logf("menu opened: [%s] (shift/reset blocked)", nm);
         else logf("menu closed");
         g_s.menuOpenLast = open;
     }
@@ -313,7 +370,7 @@ bool selfFilterCall(SelfFilter* f, const uint8_t* hit) {
     // true = ignore this hit (physics::RaycastIgnoreCallback): only our own capsule is ignored
     uint64_t id; memcpy(&id, hit + 0x14, 8);
     if ((uint32_t)id == 0xffffffffu) return false;
-    bool self = id == f->self || (g_typeLookup && f->scene && g_typeLookup(f->scene, id) == (uint16_t)g_cfg.playerLayer);
+    bool self = id == f->self || (g_typeLookup && f->scene && g_typeLookup(f->scene, id) == (uint16_t)kPlayerLayer);
     if (self) (*f->skipped)++;
     return self;
 }
@@ -378,11 +435,12 @@ void setMatrixBit(int a, int b, bool on) {
 }
 void applyBlockerLayers() {
     if (!g_matrix || !readable(g_matrix, 64 * 8)) return;
-    int P = g_cfg.playerLayer;
+    int P = kPlayerLayer;
     if (P < 0 || P >= 64) return;
+    int nIgnore = g_cfg.enabled ? g_cfg.nIgnore : 0;          // switched off: every bit goes back
     for (size_t i = 0; i < g_cleared.size(); ) {
         bool wanted = false;
-        for (int k = 0; k < g_cfg.nIgnore; k++) {
+        for (int k = 0; k < nIgnore; k++) {
             int L = g_cfg.ignoreLayers[k]; int hi = P > L ? P : L, lo = P > L ? L : P;
             if (g_cleared[i].first == hi && g_cleared[i].second == lo) wanted = true;
         }
@@ -391,7 +449,7 @@ void applyBlockerLayers() {
         logf("blockers: restored collision between layers %d and %d", g_cleared[i].first, g_cleared[i].second);
         g_cleared.erase(g_cleared.begin() + i);
     }
-    for (int k = 0; k < g_cfg.nIgnore; k++) {
+    for (int k = 0; k < nIgnore; k++) {
         int L = g_cfg.ignoreLayers[k];
         if (L < 0 || L >= 64 || L == P) continue;
         int hi = P > L ? P : L, lo = P > L ? L : P;
@@ -406,14 +464,14 @@ void applyBlockerLayers() {
 // -1 = cannot tell yet, 0 = locked, 1 = unlocked
 int anomalyUnlocked() {
     if (!g_isUnlocked || !g_s.worldDb || !g_s.abilityDb || GetTickCount() - g_s.uaaTick > 3000) return -1;
-    return (uint8_t)g_isUnlocked(g_s.abilityDb, g_s.worldDb, (uint8_t)g_cfg.abilityId) ? 1 : 0;
+    return (uint8_t)g_isUnlocked(g_s.abilityDb, g_s.worldDb, (uint8_t)kAbilityId) ? 1 : 0;
 }
 
 void requestShift(uint8_t (*b)[32], void* scene) {
     if (g_cfg.requireUnlock) {
         int u = anomalyUnlocked();
         if (u < 0) { logf("shift refused: cannot check the Gravity Anomaly unlock yet (the game's anomaly update has not run)"); return; }
-        if (u == 0) { logf("shift refused: the Gravity Anomaly ability (id %d) is not unlocked in this save", g_cfg.abilityId); return; }
+        if (u == 0) { logf("shift refused: the Gravity Anomaly ability (id %d) is not unlocked in this save", kAbilityId); return; }
     }
     // Column pointers of the interpolation view, in the system's signature order (4 per 32-byte block).
     int64_t idx = *(int64_t*)(b[3] + 8);
@@ -432,7 +490,7 @@ void requestShift(uint8_t (*b)[32], void* scene) {
     // keep the facing in the current plane
     fwd = norm(sub(fwd, mul(up, dot(fwd, up))));
 
-    Vec chest = add(pos, mul(up, g_cfg.chestHeight));
+    Vec chest = add(pos, mul(up, kChestHeight));
     Vec from = chest;                                            // from the player's centre; our capsule is filtered out
     Vec to = add(chest, mul(fwd, g_cfg.rayLength));
     SweepResult r = doSweep(scene, group, from, to, g_cfg.rayRadius, entity);
@@ -443,7 +501,7 @@ void requestShift(uint8_t (*b)[32], void* scene) {
     // Straight up as well: standing under a surface, the player can flip upside down onto it, as the
     // game's own anomaly zones allow. Whichever surface is closer wins.
     SweepResult u;
-    if (g_cfg.upRay) {
+    {
         Vec upTo = add(chest, mul(up, g_cfg.rayLength));
         u = doSweep(scene, group, chest, upTo, g_cfg.rayRadius, entity);
         if (u.hit && u.entity == entity) u.hit = false;
@@ -459,11 +517,11 @@ void requestShift(uint8_t (*b)[32], void* scene) {
         // Down from a point ahead, then back toward the ledge face from below floor level.
         newUp = fwd; why = "nothing ahead (facing)";
         Vec aheadTop = add(chest, mul(fwd, g_cfg.edgeAhead));
-        float depth = g_cfg.chestHeight + g_cfg.edgeDepth;
+        float depth = kChestHeight + g_cfg.edgeDepth;
         Vec aheadBottom = sub(aheadTop, mul(up, depth));
         SweepResult d = doSweep(scene, group, aheadTop, aheadBottom, g_cfg.rayRadius, entity);
-        logf("edge probe down: hit=%d dist=%.2f (floor level %.2f) normal (%.2f %.2f %.2f)", (int)d.hit, d.distance, g_cfg.chestHeight, d.normal.x, d.normal.y, d.normal.z);
-        if (d.hit && d.distance <= g_cfg.chestHeight + g_cfg.floorTol) {
+        logf("edge probe down: hit=%d dist=%.2f (floor level %.2f) normal (%.2f %.2f %.2f)", (int)d.hit, d.distance, kChestHeight, d.normal.x, d.normal.y, d.normal.z);
+        if (d.hit && d.distance <= kChestHeight + g_cfg.floorTol) {
             why = "floor continues ahead (facing)";
         } else {
             float backDepth = d.hit ? (d.distance - 0.15f) : depth;      // stay just above whatever is below
@@ -515,22 +573,47 @@ void requestReset(uint8_t (*b)[32]) {
     applyTarget(kIdentity, pac, plane, mpi, "reset");
 }
 
+void fileTime(const std::wstring& f, FILETIME& t) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    t = GetFileAttributesExW(f.c_str(), GetFileExInfoStandard, &fad) ? fad.ftLastWriteTime : FILETIME{};
+}
+
 void maybeReloadSettings() {
     DWORD now = GetTickCount();
     if (now - g_s.lastCfgCheck < 1000) return;
     g_s.lastCfgCheck = now;
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (GetFileAttributesExW((g_dir + L"gravitycontrol_config.ini").c_str(), GetFileExInfoStandard, &fad)) {
-        if (CompareFileTime(&fad.ftLastWriteTime, &g_s.cfgTime) != 0) {
-            g_s.cfgTime = fad.ftLastWriteTime;
-            loadSettings();
-            logf("blockers: PlayerLayer=%d IgnoreLayers count=%d", g_cfg.playerLayer, g_cfg.nIgnore);
-            logf("settings: Shift=0x%X Hold=%.1f Length=%.1f Radius=%.2f Chest=%.2f UpwardRay=%d AxisOnly=%d RequireUnlock=%d BlockInMenus=%d Diag=%d",
-                 g_cfg.keyShift, g_cfg.keyHoldSeconds, g_cfg.rayLength, g_cfg.rayRadius, g_cfg.chestHeight,
-                 g_cfg.upRay, g_cfg.axisOnly, g_cfg.requireUnlock, g_cfg.blockInMenus, g_cfg.diagnostics);
-        }
+    FILETIME ini, menu;
+    fileTime(g_dir + L"gravitycontrol_config.ini", ini);
+    fileTime(g_dir + L"ModMenuConfig\\gravitycontrol.ini", menu);
+    if (CompareFileTime(&ini, &g_s.cfgTime) != 0 || CompareFileTime(&menu, &g_s.menuCfgTime) != 0) {
+        g_s.cfgTime = ini; g_s.menuCfgTime = menu;
+        loadSettings();
+        logSettings();
+    }
+    if (g_cfg.enabled != g_s.enabledLast) {
+        if (g_s.enabledLast != -1 || !g_cfg.enabled) logf(g_cfg.enabled ? "enabled" : "disabled (Enable is off in the MODS menu or the ini): inputs are ignored");
+        g_s.enabledLast = g_cfg.enabled;
     }
     applyBlockerLayers();
+}
+
+// Buttons of every connected XInput pad, in the shared mask layout. Only slots known to hold a pad are
+// asked here: asking an empty slot can stall for milliseconds, so xinputThread looks for new pads.
+uint32_t xinputButtons() {
+    if (!g_xinputGetState) return 0;
+    uint32_t slots = g_xiSlots.load(std::memory_order_relaxed), m = 0;
+    for (DWORD i = 0; i < 4; i++) {
+        if (!(slots & (1u << i))) continue;
+        XINPUT_STATE st{};
+        if (g_xinputGetState(i, &st) != ERROR_SUCCESS) {
+            g_xiSlots.fetch_and(~(1u << i)); logf("controller: XInput pad in slot %lu gone", i);
+            continue;
+        }
+        m |= st.Gamepad.wButtons;
+        if (st.Gamepad.bLeftTrigger > 60) m |= sonypad::kLT;
+        if (st.Gamepad.bRightTrigger > 60) m |= sonypad::kRT;
+    }
+    return m;
 }
 
 bool gameHasFocus() {
@@ -542,6 +625,11 @@ bool gameHasFocus() {
 void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p5) {
     g_s.bodyCalls++;
     maybeReloadSettings();
+    if (!g_cfg.enabled) {
+        // Switched off: give the plane back to the game and forget half-pressed inputs.
+        if (g_s.engaged) { logf("disabled while shifted: returning to normal gravity"); requestReset(blocks); }
+        g_s.keyShiftDown = g_s.padDown = false;
+    }
     if (g_s.engaged || g_s.releasing) {
         // The interpolation waits for the game's transition animation while MPI+0x48 is set; we play no
         // animation, so clear the wait and let it start on this frame.
@@ -556,7 +644,7 @@ void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p
         }
         if (g_s.releasing && !mpi[0x4b] && !mpi[0x49]) { g_s.releasing = false; logf("reset transition finished"); }
     }
-    if (gameHasFocus()) {
+    if (g_cfg.enabled && gameHasFocus()) {
         bool doShift = false, doReset = false;
         DWORD know = GetTickCount();
         bool shift = g_cfg.keyShift && (GetAsyncKeyState(g_cfg.keyShift) & 0x8000) != 0;
@@ -566,26 +654,19 @@ void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p
         }
         if (!shift && g_s.keyShiftDown && !g_s.keyConsumed) { doShift = true; logf("key: tap -> shift"); }
         g_s.keyShiftDown = shift;
-        // Controller: tap = shift, hold for HoldSeconds = reset.
-        if (g_cfg.padEnabled && g_xinputGetState) {
-            DWORD now = GetTickCount();
-            if (now >= g_s.padRetryAt) {
-                XINPUT_STATE st{};
-                DWORD rc = g_xinputGetState(0, &st);
-                if (rc == ERROR_SUCCESS) {
-                    bool down = (st.Gamepad.wButtons & (WORD)g_cfg.padButton) != 0;
-                    if (down && !g_s.padDown) { g_s.padDownAt = now; g_s.padConsumed = false; }
-                    if (down && g_s.padDown && !g_s.padConsumed && now - g_s.padDownAt >= (DWORD)(g_cfg.padHoldSeconds * 1000.f)) {
-                        g_s.padConsumed = true; doReset = true; logf("pad: hold -> reset");
-                    }
-                    if (!down && g_s.padDown && !g_s.padConsumed) { doShift = true; logf("pad: tap -> shift"); }
-                    g_s.padDown = down;
-                } else {
-                    g_s.padDown = false; g_s.padRetryAt = now + 2000;   // no pad: ask again in 2 s
-                }
+        // Controller: tap = shift, hold for HoldSeconds = reset. XInput pads and PlayStation pads read over
+        // HID feed one button mask, so a pad that shows up both ways (Steam Input) still counts once.
+        if (g_cfg.padEnabled && g_cfg.padButton) {
+            uint32_t buttons = xinputButtons() | g_hidButtons.load(std::memory_order_relaxed);
+            bool down = (buttons & (uint32_t)g_cfg.padButton) != 0;
+            if (down && !g_s.padDown) { g_s.padDownAt = know; g_s.padConsumed = false; }
+            if (down && g_s.padDown && !g_s.padConsumed && know - g_s.padDownAt >= (DWORD)(g_cfg.padHoldSeconds * 1000.f)) {
+                g_s.padConsumed = true; doReset = true; logf("pad: hold -> reset");
             }
-        }
-        if ((doShift || doReset) && g_cfg.blockInMenus && menuOpen() == 1) {
+            if (!down && g_s.padDown && !g_s.padConsumed) { doShift = true; logf("pad: tap -> shift"); }
+            g_s.padDown = down;
+        } else g_s.padDown = false;
+        if ((doShift || doReset) && menuOpen() == 1) {
             DWORD now2 = GetTickCount();
             if (now2 - g_s.menuIgnoreLog > 2000) { char nm[40]; menuName(g_s.menuState, nm, sizeof nm); logf("input ignored: a menu is open [%s]", nm); g_s.menuIgnoreLog = now2; }
             doShift = doReset = false;
@@ -609,7 +690,7 @@ void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p
         int64_t idx = *(int64_t*)(blocks[3] + 8);
         Quat* plane = (Quat*)(*(uint8_t**)(blocks[0] + 16) + idx * 0x10);
         uint8_t* mpi = *(uint8_t**)(blocks[1] + 0) + idx * 0x50;
-        logf("diag: anomaly ability %d unlocked=%d (require=%d) | menu open=%d (block=%d)", g_cfg.abilityId, anomalyUnlocked(), g_cfg.requireUnlock, menuOpen(), g_cfg.blockInMenus);
+        logf("diag: anomaly ability %d unlocked=%d (require=%d) | menu open=%d", kAbilityId, anomalyUnlocked(), g_cfg.requireUnlock, menuOpen());
         logf("diag: plane (%.3f %.3f %.3f %.3f) mpi active=%d pending=%d elapsed=%.2f duration=%.2f target (%.3f %.3f %.3f %.3f) | uaaCalls=%u startCalls=%u rules=%s pad+0=%llx pad+0x48=%d",
              plane->x, plane->y, plane->z, plane->w, mpi[0x49], mpi[0x4b], *(float*)(mpi + 0x38), *(float*)(mpi + 0x3c),
              *(float*)(mpi + 0x10), *(float*)(mpi + 0x14), *(float*)(mpi + 0x18), *(float*)(mpi + 0x1c),
@@ -685,38 +766,221 @@ bool resolveAnchors() {
     return ok;
 }
 
+bool dialogs() { return GetEnvironmentVariableW(L"GRAVITYCONTROL_NO_DIALOGS", nullptr, 0) == 0; }   // tests switch the pop-ups off
+
+// ---------------------------------------------------------------- other copies of the mod
+// 1.0 was installed flat (crmods\gravitycontrol.dll) and has no way to be told to stop. A copy from 1.1
+// on exports GravityControl_InstanceGuard and takes a mutex: the first one in the process is in charge.
+struct OtherCopy { HMODULE mod = nullptr; uintptr_t base = 0; size_t size = 0; std::wstring path; };
+struct Copies { bool second = false; std::wstring inCharge; std::vector<OtherCopy> legacy; };
+
+Copies findCopies() {
+    Copies c;
+    wchar_t name[64]; swprintf_s(name, L"Local\\GravityControl.Instance.%lu", GetCurrentProcessId());
+    HANDLE m = CreateMutexW(nullptr, FALSE, name);
+    c.second = m && GetLastError() == ERROR_ALREADY_EXISTS;      // a 1.1+ copy got here first
+    if (c.second) CloseHandle(m); else g_instanceMutex = m;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+        if (snap == INVALID_HANDLE_VALUE) { if (GetLastError() == ERROR_BAD_LENGTH) continue; break; }
+        MODULEENTRY32W me; me.dwSize = sizeof me;
+        if (Module32FirstW(snap, &me)) do {
+            if (me.hModule == g_self) continue;
+            if (_wcsicmp(me.szModule, L"gravitycontrol.dll") && _wcsicmp(me.szModule, L"gravityshift.dll")) continue;
+            if (GetProcAddress(me.hModule, "GravityControl_InstanceGuard")) { c.inCharge = me.szExePath; continue; }
+            OtherCopy o; o.mod = me.hModule; o.base = (uintptr_t)me.modBaseAddr; o.size = me.modBaseSize; o.path = me.szExePath;
+            c.legacy.push_back(o);
+        } while (Module32NextW(snap, &me));
+        CloseHandle(snap);
+        break;
+    }
+    return c;
+}
+
+// True while a thread that was started inside [base, base + size) is alive: an older copy's init thread.
+bool threadStartedIn(uintptr_t base, size_t size) {
+    typedef LONG (NTAPI *QueryFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static QueryFn query = (QueryFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
+    if (!query) return false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    THREADENTRY32 te; te.dwSize = sizeof te; bool any = false; DWORD pid = GetCurrentProcessId();
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        uintptr_t start = 0;
+        if (query(t, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof start, nullptr) == 0 && start >= base && start < base + size) any = true;
+        CloseHandle(t);
+    } while (!any && Thread32Next(snap, &te));
+    CloseHandle(snap);
+    return any;
+}
+
+// A function start as MinHook leaves it: "E9 rel32" to a relay "FF 25 00000000 <address>", here with the
+// address inside the module [base, base + size).
+bool hookedBy(const uint8_t* site, uintptr_t base, size_t size) {
+    if (site[0] != 0xE9) return false;
+    int32_t rel; memcpy(&rel, site + 1, 4);
+    const uint8_t* relay = site + 5 + rel;
+    if (!readable(relay, 14) || relay[0] != 0xFF || relay[1] != 0x25) return false;
+    int32_t disp; memcpy(&disp, relay + 2, 4);
+    uintptr_t target; memcpy(&target, relay + 6, 8);
+    return disp == 0 && target >= base && target < base + size;
+}
+
+bool textSection(const uint8_t*& text, size_t& size) {
+    HMODULE exe = GetModuleHandleW(nullptr);
+    auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (memcmp(sec[i].Name, ".text", 5) == 0) { text = (uint8_t*)exe + sec[i].VirtualAddress; size = sec[i].Misc.VirtualSize; return true; }
+    return false;
+}
+
+// An older copy is loaded: wait until it has finished starting, then put the original bytes back where it
+// hooked the game. Its hook functions are never reached again, so it stays loaded but does nothing, and
+// this copy hooks the untouched functions as usual. This runs while the game is still starting up.
+void takeOver(const OtherCopy& old) {
+    logf("an older copy is loaded (%ls): taking over from it", old.path.c_str());
+    DWORD t0 = GetTickCount();
+    while (threadStartedIn(old.base, old.size) && GetTickCount() - t0 < 120000) Sleep(100);
+    const uint8_t* text = nullptr; size_t textSize = 0;
+    if (!textSection(text, textSize) || textSize < 64) return;
+    static const int hooked[] = { A_START, A_MPI, A_UAA, A_MENU };
+    int removed = 0;
+    for (int id : hooked) {
+        const Anchor& a = g_anchors[id];
+        std::string b, m; parsePattern(a.pattern, b, m);
+        // the hook overwrote the first 5 bytes: find the function by the rest of its pattern
+        int count = 0; uintptr_t off = findPattern(text + 5, textSize - 5, b.substr(5), m.substr(5), count);
+        if (count != 1) { logf("takeover: %s not found (%d matches)", a.name, count); continue; }
+        uint8_t* site = (uint8_t*)text + off;
+        if (memcmp(site, b.data(), 5) == 0) continue;                       // not hooked
+        if (!hookedBy(site, old.base, old.size)) { logf("takeover: %s is hooked by something else; left alone", a.name); continue; }
+        DWORD prot = 0;
+        if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &prot)) { logf("takeover: cannot write at %s (error %lu)", a.name, GetLastError()); continue; }
+        memcpy(site, b.data(), 5);
+        VirtualProtect(site, 5, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+        removed++;
+    }
+    logf("takeover: removed %d hook(s) of the older copy after %lu ms; it stays loaded but does nothing", removed, GetTickCount() - t0);
+}
+
+bool fileExists(const std::wstring& f) { return GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+// Renames a file in place by appending ".old" (".old2" ... when that name is taken). Nothing is deleted or
+// overwritten. A loaded DLL can be renamed, and the loader only picks up names ending in .dll.
+bool renameOld(const std::wstring& f, const char* what) {
+    if (!fileExists(f)) return true;
+    DWORD err = 0;
+    for (int i = 1; i <= 9; i++) {
+        std::wstring to = f + (i == 1 ? std::wstring(L".old") : L".old" + std::to_wstring(i));
+        if (fileExists(to)) continue;
+        if (MoveFileExW(f.c_str(), to.c_str(), 0)) { logf("upgrade: renamed the old %s to %ls", what, to.c_str()); return true; }
+        err = GetLastError();
+        break;
+    }
+    logf("upgrade: could not rename the old %s %ls (error %lu); it is tried again on the next start", what, f.c_str(), err);
+    return false;
+}
+
+// This copy lives in crmods\<folder>\. The files a flat 1.0 install left in crmods\ are renamed with
+// ".old" on the end, so the next start loads this copy only. The player deletes them when they like.
+void retireFlatInstall() {
+    std::wstring here = g_dir.substr(0, g_dir.size() - 1);
+    size_t p = here.find_last_of(L"\\/"); if (p == std::wstring::npos) return;
+    std::wstring crmods = here.substr(0, p);                                  // ...\crmods
+    size_t q = crmods.find_last_of(L"\\/"); if (q == std::wstring::npos) return;
+    if (_wcsicmp(crmods.substr(q + 1).c_str(), L"crmods") != 0) return;       // not installed as crmods\<folder>\: nothing to do
+    std::wstring game = crmods.substr(0, q + 1); crmods += L"\\";
+    renameOld(crmods + L"gravitycontrol.dll", "DLL");
+    renameOld(crmods + L"gravitycontrol_config.ini", "settings file");
+    renameOld(crmods + L"gravitycontrol.log", "log");                         // held open while the old copy is loaded
+    std::wstring readme = game + L"README-GravityControl.txt";               // the 1.0 archive put its readme in the game folder
+    FILE* fp = nullptr;
+    if (!_wfopen_s(&fp, readme.c_str(), L"rb") && fp) {
+        char head[20] = {}; fread(head, 1, 18, fp); fclose(fp);
+        if (!strcmp(head, "GravityControl 1.0")) renameOld(readme, "readme");
+    }
+}
+
+// Nothing of ours is hooked yet: leave the process, so Mod Settings Menu shows the mod as not loaded
+// instead of "Running".
+DWORD unloadSelf() {
+    logf("unloading this copy");
+    if (g_instanceMutex) { CloseHandle(g_instanceMutex); g_instanceMutex = nullptr; }
+    FreeLibraryAndExitThread(g_self, 0);
+    return 0;
+}
+
+bool padWanted() { return g_cfg.enabled && g_cfg.padEnabled && g_cfg.padButton; }
+bool padVerbose() { return g_cfg.diagnostics != 0; }
+DWORD WINAPI hidThread(LPVOID) { sonypad::run(g_hidButtons, padWanted, padVerbose, logf); return 0; }
+DWORD WINAPI xinputThread(LPVOID) {
+    for (;;) {
+        if (g_xinputGetState && padWanted()) {
+            for (DWORD i = 0; i < 4; i++) {
+                if (g_xiSlots.load() & (1u << i)) continue;
+                XINPUT_STATE st{};
+                if (g_xinputGetState(i, &st) == ERROR_SUCCESS) { g_xiSlots.fetch_or(1u << i); logf("controller: XInput pad in slot %lu", i); }
+            }
+        }
+        Sleep(2000);
+    }
+}
+
 DWORD WINAPI initThread(LPVOID) {
     loadSettings();
+    logSettings();
+    Copies copies = findCopies();
+    if (copies.second) {
+        // Another 1.1+ copy is in charge (it loaded first). This one only tidies up and leaves.
+        retireFlatInstall();
+        logf("inactive: another copy of GravityControl is already in charge (%ls)", copies.inCharge.c_str());
+        return unloadSelf();
+    }
+    for (const OtherCopy& old : copies.legacy) takeOver(old);
+    retireFlatInstall();
     bool anchorsOk = resolveAnchors();
-    if (!g_buildMatch && g_cfg.versionWarning) {
+    if (!g_buildMatch && g_cfg.versionWarning && dialogs()) {
         MessageBoxW(nullptr,
             anchorsOk ? L"Your game version is different from the one this version of GravityControl was made for, so there might be issues.\n\n"
-                        L"To turn this warning off, set VersionWarning=0 in crmods\\gravitycontrol_config.ini."
+                        L"To turn this warning off, set VersionWarning=0 in gravitycontrol_config.ini, or switch it off under Options > MODS."
                       : L"Your game version is different from the one this version of GravityControl was made for, and the mod could not find its hook points in it.\n\n"
-                        L"GravityControl stays inactive until it is updated. Details are in crmods\\gravitycontrol.log.",
+                        L"GravityControl stays inactive until it is updated. Details are in gravitycontrol.log, next to the mod.",
             L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
     }
-    if (!anchorsOk) { logf("GravityControl inactive: anchors missing, the game runs unmodified"); return 0; }
-    if (MH_Initialize() != MH_OK) { logf("FAIL: MinHook init"); return 0; }
+    if (!anchorsOk) { logf("GravityControl inactive: anchors missing, the game runs unmodified"); return unloadSelf(); }
+    if (MH_Initialize() != MH_OK) { logf("FAIL: MinHook init"); return unloadSelf(); }
     {
         HMODULE xi = LoadLibraryW(L"xinput1_4.dll");
         if (!xi) xi = LoadLibraryW(L"xinput9_1_0.dll");
         if (xi) g_xinputGetState = (XInputGetStateFn)GetProcAddress(xi, "XInputGetState");
-        logf("controller: %s", g_xinputGetState ? "XInputGetState ready (d-pad up: tap = shift, hold = reset)" : "XInput not available");
+        logf("controller: %s; PlayStation pads are read over HID", g_xinputGetState ? "XInput ready" : "XInput not available");
     }
     g_sweep = (SweepFn)g_anchors[A_SWEEP].found;
     g_typeLookup = (TypeLookupFn)g_anchors[A_TYPE].found;
     g_isUnlocked = (UnlockFn)g_anchors[A_UNLOCK].found;
-    if (MH_CreateHook((void*)g_anchors[A_START].found, (void*)hkStart, (void**)&g_origStart) != MH_OK) { logf("FAIL: hook start_helper"); return 0; }
-    if (MH_CreateHook((void*)g_anchors[A_MPI].found, (void*)hkBody, (void**)&g_origBody) != MH_OK) { logf("FAIL: hook mpi_body"); return 0; }
-    if (MH_CreateHook((void*)g_anchors[A_UAA].found, (void*)hkUaa, (void**)&g_origUaa) != MH_OK) { logf("FAIL: hook uaa_body"); return 0; }
-    if (MH_CreateHook((void*)g_anchors[A_MENU].found, (void*)hkMenu, (void**)&g_origMenu) != MH_OK) { logf("FAIL: hook menu_broadcast"); return 0; }
+    const char* failed = nullptr;
+    if (MH_CreateHook((void*)g_anchors[A_START].found, (void*)hkStart, (void**)&g_origStart) != MH_OK) failed = "start_helper";
+    else if (MH_CreateHook((void*)g_anchors[A_MPI].found, (void*)hkBody, (void**)&g_origBody) != MH_OK) failed = "mpi_body";
+    else if (MH_CreateHook((void*)g_anchors[A_UAA].found, (void*)hkUaa, (void**)&g_origUaa) != MH_OK) failed = "uaa_body";
+    else if (MH_CreateHook((void*)g_anchors[A_MENU].found, (void*)hkMenu, (void**)&g_origMenu) != MH_OK) failed = "menu_broadcast";
+    if (failed) { logf("FAIL: hook %s", failed); MH_Uninitialize(); return unloadSelf(); }
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) { logf("FAIL: enable hooks"); return 0; }
-    logf("active: GravityControl 1.0 - tap the Shift key (0x%X) or d-pad up to shift gravity, hold it to reset", g_cfg.keyShift);
+    CreateThread(nullptr, 0, hidThread, nullptr, 0, nullptr);
+    CreateThread(nullptr, 0, xinputThread, nullptr, 0, nullptr);
+    logf("active: GravityControl 1.1 - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
+         g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0);
     return 0;
 }
 
 } // namespace
+
+// Marks a copy that guards against a second instance (1.1 and later); see findCopies().
+extern "C" __declspec(dllexport) const int GravityControl_InstanceGuard = 1;
 
 // Third-party notices, embedded in the binary (BSD-2-Clause requires them with binary distributions).
 extern "C" __declspec(dllexport) const char GravityControl_ThirdPartyNotices[] =
@@ -803,18 +1067,19 @@ extern "C" __declspec(dllexport) const char GravityControl_ThirdPartyNotices[] =
     "NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS\n"
     "SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n";
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_self = inst;
         DisableThreadLibraryCalls(inst);
         wchar_t path[MAX_PATH]; GetModuleFileNameW(inst, path, MAX_PATH);
         g_dir = path; size_t p = g_dir.find_last_of(L"\\/"); g_dir = g_dir.substr(0, p + 1);
         InitializeCriticalSection(&g_logLock);
         g_t0 = GetTickCount();
         _wfopen_s(&g_log, (g_dir + L"gravitycontrol.log").c_str(), L"w");
-        logf("GravityControl 1.0 loading from %ls", g_dir.c_str());
+        logf("GravityControl 1.1 loading from %ls", g_dir.c_str());
         CreateThread(nullptr, 0, initThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
-        logf("game exiting");
+        logf(reserved ? "game exiting" : "unloaded");
         if (g_log) fclose(g_log);
     }
     return TRUE;

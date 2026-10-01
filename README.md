@@ -8,13 +8,18 @@ and the collision fix-up are the game's own.
 - **Shift**: tap Right Shift or d-pad up. The closer surface ahead or above wins.
 - **Reset**: hold the same key or button for a second.
 - Needs the Gravity Anomaly ability unlocked in your save. Does nothing while a menu is open.
+- Xbox, DualSense and DualShock 4 controllers work.
+- With Mod Settings Menu installed, every setting is under Options > MODS, with an Enable switch.
 
 ## Install
 
 Grab `GravityControl.zip` from the [releases](../../releases) and extract it into the game folder
-(next to `CONTROLResonant.exe`). It needs crloader,
+(next to `CONTROLResonant.exe`). Everything lands in `crmods\GravityControl\`. It needs crloader,
 the `winmm.dll` mod loader, which you already have if you run other DLL mods. Full details are in
 [README-GravityControl.txt](README-GravityControl.txt).
+
+Upgrading from 1.0: just extract. On its first start 1.1 takes over from the old flat files in
+`crmods\` and renames them with `.old` on the end. Nothing is deleted.
 
 Made for Steam build 25472515. On another game version the mod warns once at start and runs anyway.
 
@@ -27,8 +32,11 @@ build.bat
 ```
 
 It compiles `gravitycontrol.cpp` with the vendored [MinHook](https://github.com/TsudaKageyu/minhook)
-into `out\gravitycontrol.dll`. Copy the DLL and `gravitycontrol_config.ini` into the game's
-`crmods\` folder.
+into `out\gravitycontrol.dll`. Copy the DLL, `gravitycontrol_config.ini` and
+`gravitycontrol.menu.json` into `crmods\GravityControl\` in the game folder.
+
+`tests\build_padtest.bat` builds `out\padtest.exe`, which checks the PlayStation controller report
+layouts in `sonypad.h` and prints the buttons it reads from a connected pad.
 
 ## How it works
 

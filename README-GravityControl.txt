@@ -1,4 +1,4 @@
-GravityControl 1.0 - arbitrary gravity direction for CONTROL Resonant
+GravityControl 1.1 - arbitrary gravity direction for CONTROL Resonant
 =====================================================================
 
 Allows free use of the Gravity Anomaly ability on-demand after acquiring it,
@@ -6,26 +6,31 @@ not just in designated zones.
 
 REQUIRES
   crloader (the winmm.dll mod loader) in the game folder. If you run other DLL mods, you have it.
+  Optional: Mod Settings Menu, to change the settings in game under Options > MODS.
 
 INSTALL
-  1. Extract this archive into the game folder (next to CONTROLResonant.exe):
-       crmods\gravitycontrol.dll
-       crmods\gravitycontrol_config.ini
-  2. Start the game. Once the Gravity Anomaly ability is unlocked in your save, tap Right Shift
+  1. Extract this archive into the game folder (next to CONTROLResonant.exe). Everything goes
+     into one folder:
+       crmods\GravityControl\
+  2. Upgrading from 1.0: just extract. On its first start 1.1 takes over from the old files in
+     crmods\ and renames them with .old on the end. Nothing is deleted; remove the .old files
+     when you like. Settings from the old ini are not carried over.
+  3. Start the game. Once the Gravity Anomaly ability is unlocked in your save, tap Right Shift
      or d-pad up.
   Made for Steam build 25472515. On another game version the mod warns once at start and runs
   anyway; if the game changed too much for it, it stays inactive and says so.
 
 UNINSTALL
-  Delete crmods\gravitycontrol.dll, crmods\gravitycontrol_config.ini and crmods\gravitycontrol.log.
+  Delete the crmods\GravityControl folder.
 
 CONTROLS
   Shift   tap Right Shift or d-pad up
   Reset   hold Right Shift or d-pad up for one second
-  Both can be changed in gravitycontrol_config.ini.
+  Both can be changed under Options > MODS or in gravitycontrol_config.ini.
+  Xbox, DualSense and DualShock 4 controllers work, with or without Steam Input.
 
 HOW IT PLAYS
-  Shift looks ahead and straight up; the closer surface within 10 m wins and gravity turns toward
+  Shift looks ahead and straight up; the closer surface within 5 m wins and gravity turns toward
   it, so you land on the wall you face or flip onto the ceiling above you. With nothing there, it
   probes past the edge in front of you, or simply turns gravity to your facing (roll forward over
   an edge you just crested). The new "up" is always a world axis.
@@ -35,11 +40,16 @@ HOW IT PLAYS
   Gravity Anomaly ability.
 
 SETTINGS
-  crmods\gravitycontrol_config.ini, commented, reloaded while the game runs.
+  crmods\GravityControl\gravitycontrol_config.ini, commented, reloaded while the game runs.
+  With Mod Settings Menu, the same settings are under Options > MODS > GravityControl, with an
+  Enable switch at the top. Its header shows the version and whether the mod is running.
+  A value changed in the menu wins over the ini.
   [Blockers] is experimental and off; its comment says why to leave it alone.
 
 LOG
-  crmods\gravitycontrol.log, rewritten every start. Every shift logs what the ray found.
+  crmods\GravityControl\gravitycontrol.log, rewritten every start. Every shift logs what the
+  ray found. If a controller button does not respond, turn on Diagnostics, press the button a
+  few times in game, and send this log.
 
 THIRD-PARTY NOTICES
   gravitycontrol.dll contains MinHook and its Hacker Disassembler Engine. Their license requires
