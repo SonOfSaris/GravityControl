@@ -1,0 +1,34 @@
+GravityControl changelog
+========================
+
+1.0   Release. Keyboard: Right Shift (tap = shift, hold = reset). On a different game build the mod
+      warns once at start (VersionWarning) and runs anyway. Shorter ini comments and readme.
+      Release. The mod is now called GravityControl: gravitycontrol.dll, gravitycontrol_config.ini,
+      gravitycontrol.log. (Development builds up to this point were named GravityShift.)
+1.18  Files renamed for consistency: gravityshift.dll, gravityshift_config.ini, gravityshift.log.
+      Delete the old GravityShift.ini and GravityShift.log when upgrading.
+1.17  The [Transition] settings are internal now (the game's own duration, eased blend and pivot).
+1.16  No gameplay change. The MinHook third-party notices are embedded in the DLL and reproduced in
+      the readme instead of shipping as a separate file.
+1.15  Upward ray: a second sweep straight up; the closer of the forward and upward surfaces wins,
+      so you can flip upside down onto a ceiling above you. [Ray] UpwardRay toggles it.
+1.14  Fixed the ray never detecting anything (the engine's hit filter answers "ignore this hit",
+      and 1.13 had it backwards). Fall respawns now reset gravity normally while the mod is engaged,
+      and Reset works after a respawn left you on a turned plane.
+1.13  Fixed a crash on the first shift (hit filter calling convention).
+1.12  The ray starts from the player's centre; the player's own capsule is filtered out of the sweep.
+      StartOffset removed.
+1.11  Removed the ceiling probe diagnostics and the QueryFlags / ForwardSign / [HitRecord] settings
+      (now internal constants).
+1.10  Keys and pad buttons are ignored while a game menu is open (wardrobe, shop, talents, ability
+      and melee select). [General] BlockInMenus.
+1.9   Shifting requires the Gravity Anomaly ability to be unlocked in the save, the same check the
+      game's own anomaly scan makes. [General] RequireAnomalyUnlocked.
+1.8   [Blockers] option to switch off collision with a physics layer (experimental, off by default).
+1.7   Ceiling probe (removed again in 1.11).
+1.6   The new up is always a world axis (AxisOnly). Entering one of the game's anomaly zones hands
+      the plane to the game; shifting from inside one clears its bookkeeping.
+1.5   Controller support (d-pad up: tap = shift, hold = reset). Over-the-edge probe. Axis snapping.
+1.4   Fixed crashes from a wrong pivot argument; the game's eased transition is used.
+1.1   First working build: the camera turned, the character did not yet.
+1.0   Initial build.
