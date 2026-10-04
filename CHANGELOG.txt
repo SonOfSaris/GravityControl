@@ -1,6 +1,15 @@
 GravityControl changelog
 ========================
 
+1.2.2 The message at start explains itself: mod version, game version (with the exe's file version),
+      game build date, which game function failed and the likely cause. On a game version the mod
+      supports, it points at other mods instead of a game update. It ends with what to include in
+      a report, and Ctrl+C copies it. The same text goes into the log.
+      The log lists the store the game runs from and the other mod files that are loaded.
+      Newest copy wins: when an older copy of the mod is installed as well, the newest one takes
+      its place, closes the older copy's message, and renames the older copy's DLL and menu file
+      with .old on the end, so only one copy loads from then on. (Until 1.2.1 a newer copy stood
+      down without a word when an older one had loaded first.)
 1.2.1 Works next to other mods that hook the same game functions. 1.2 did not recognise a function
       that another mod had hooked first, took that for a game update and switched itself off
       (reported on game 1.4.1 by players who also run Gameplay Tweaks). Such a function is now

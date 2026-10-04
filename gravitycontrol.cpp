@@ -1,4 +1,4 @@
-// GravityControl 1.2.1 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515 up to game version 1.4.1).
+// GravityControl 1.2.2 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515 up to game version 1.4.1).
 //
 // How it works (see _modding-research/NOTES.md):
 //   The player's "down" is the quaternion in coregame::component::MovementPlane. The game's own
@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <ctime>
+#include <cwctype>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -32,8 +34,13 @@
 
 namespace {
 
-const char kVersion[] = "1.2.1";
-const wchar_t kTitle[] = L"GravityControl 1.2.1";       // title of the message boxes
+#ifndef GC_VERSION
+#define GC_VERSION "1.2.2"
+#endif
+#define GC_WIDE2(x) L##x
+#define GC_WIDE(x) GC_WIDE2(x)
+const char kVersion[] = GC_VERSION;
+const wchar_t kTitle[] = L"GravityControl " GC_WIDE(GC_VERSION);    // title of the message boxes
 
 // ---------------------------------------------------------------- small math
 struct Quat { float x, y, z, w; };
@@ -291,6 +298,7 @@ std::atomic<uint32_t> g_hidButtons{ 0 };   // PlayStation pads read over HID (so
 std::atomic<uint32_t> g_xiSlots{ 0 };      // XInput slots that have a pad, found by xinputThread
 HMODULE g_self = nullptr;
 HANDLE g_instanceMutex = nullptr;            // held while this copy is the one in charge
+std::atomic<bool> g_yielded{ false };        // a newer copy took over: the hooks only pass the game's calls on
 
 // ---------------------------------------------------------------- state (game thread only)
 struct State {
@@ -318,6 +326,7 @@ bool sameQuat(const Quat& a, const Quat& b) {
 // ---------------------------------------------------------------- hooks
 void hkStart(const Quat* target, uint64_t entity, float duration, uint8_t linear,
              void* pac, Quat* plane, uint8_t* mpi, uint8_t* cam) {
+    if (g_yielded) { g_origStart(target, entity, duration, linear, pac, plane, mpi, cam); return; }
     g_s.startCalls++;
     logf("game start call #%u: target (%.3f %.3f %.3f %.3f) entity %llx duration %.2f linear %d cam %p%s",
          g_s.startCalls, target->x, target->y, target->z, target->w, (unsigned long long)entity, duration, linear, cam,
@@ -354,6 +363,7 @@ void menuName(const uint8_t* st, char* out, size_t n) {
     out[k] = 0;
 }
 void hkMenu(void* ent, uint8_t* state, void* world) {
+    if (g_yielded) { g_origMenu(ent, state, world); return; }
     g_s.menuState = state; g_s.menuTick = GetTickCount();
     g_origMenu(ent, state, world);
     int open = state[0x54] ? 1 : 0;
@@ -367,6 +377,7 @@ void hkMenu(void* ent, uint8_t* state, void* world) {
 
 void hkUaa(uint8_t (*blocks)[32], uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6,
            uintptr_t a7, uintptr_t a8, uintptr_t a9, uintptr_t a10, uintptr_t a11, uintptr_t a12) {
+    if (g_yielded) { g_origUaa(blocks, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12); return; }
     g_s.uaaCalls++;
     // view: block0 = PlayerAnomalyData(0x50), PlayerAnomalyRequest(0x24), MPI(0x50), CameraPlaneInterpolation(0xf0);
     //       block1 = AnomalyRules(4), PlayerAnomalyComponent(0xf0), ...; block3 +0x10 = entity index
@@ -675,6 +686,7 @@ bool gameHasFocus() {
 }
 
 void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p5) {
+    if (g_yielded) { g_origBody(blocks, p2, scenePtr, dt, p5); return; }
     g_s.bodyCalls++;
     maybeReloadSettings();
     if (!g_cfg.enabled) {
@@ -791,12 +803,40 @@ uintptr_t findPattern(const uint8_t* base, size_t size, const std::string& bytes
     return first;
 }
 
-// Game builds this version was checked on, by PE timestamp. Any other build is tried all the same: the
-// patterns decide whether the mod can run, not the timestamp.
-const DWORD kKnownBuilds[] = { 0x6AB107A0,      // Steam build 25472515
-                               0x6ABA5BB8,      // game 1.4.0, the update of 2026-10-01 (changelist 5642085)
-                               0x6ABEF018 };    // game 1.4.1, Steam build 25673981 (changelist 5644780)
+// Game builds this version was checked on, by PE timestamp, with the version the game calls them. Any
+// other build is tried all the same: the patterns decide whether the mod can run, not the timestamp.
+struct KnownBuild { DWORD stamp; const char* version; };
+const KnownBuild kKnownBuilds[] = { { 0x6AB107A0, "1.0" },        // Steam build 25472515
+                                    { 0x6ABA5BB8, "1.4.0" },      // the update of 2026-10-01 (changelist 5642085)
+                                    { 0x6ABEF018, "1.4.1" } };    // Steam build 25673981 (changelist 5644780)
 bool g_buildKnown = false;
+std::string g_gameVersion, g_fileVersion, g_buildDate;      // of the game image; filled by resolveAnchors
+
+// File version of an image from its version resource ("0.564.478.0"); empty when it has none. The game's
+// files carry no other version: the number the game shows is only known for the builds listed above.
+std::string fileVersionOf(HMODULE img) {
+    HRSRC res = FindResourceW(img, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(16));      // RT_VERSION
+    HGLOBAL h = res ? LoadResource(img, res) : nullptr;
+    const uint8_t* p = h ? (const uint8_t*)LockResource(h) : nullptr;
+    DWORD n = p ? SizeofResource(img, res) : 0;
+    for (DWORD i = 0; i + 16 <= n; i += 4) {
+        uint32_t sig; memcpy(&sig, p + i, 4);
+        if (sig != 0xFEEF04BD) continue;                    // start of VS_FIXEDFILEINFO; the file version follows at +8
+        uint32_t ms, ls; memcpy(&ms, p + i + 8, 4); memcpy(&ls, p + i + 12, 4);
+        char out[64]; sprintf_s(out, "%u.%u.%u.%u", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff);
+        return out;
+    }
+    return "";
+}
+
+// The day an image was built, from its PE timestamp: "1 October 2026".
+std::string dateOf(DWORD stamp) {
+    static const char* months[] = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+    time_t t = stamp; struct tm d{};
+    if (gmtime_s(&d, &t)) return "";
+    char out[40]; sprintf_s(out, "%d %s %d", d.tm_mday, months[d.tm_mon], 1900 + d.tm_year);
+    return out;
+}
 
 // The image the anchors are looked up in: this process's exe. A test can name a game exe to map as data
 // instead (GRAVITYCONTROL_TEST_IMAGE), which checks the patterns and the hook creation against real code.
@@ -879,9 +919,11 @@ bool resolveAnchors() {
     HMODULE exe = gameImage();
     auto* nt = (IMAGE_NT_HEADERS*)((uint8_t*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
     DWORD stamp = nt->FileHeader.TimeDateStamp;
-    for (DWORD b : kKnownBuilds) if (b == stamp) g_buildKnown = true;
-    logf("game image %p, build timestamp 0x%08X: %s", exe, stamp,
-         g_buildKnown ? "a build this version was checked on" : "not a build this version knows, trying anyway");
+    for (const KnownBuild& b : kKnownBuilds) if (b.stamp == stamp) { g_buildKnown = true; g_gameVersion = b.version; }
+    g_fileVersion = fileVersionOf(exe); g_buildDate = dateOf(stamp);
+    logf("game image %p, build timestamp 0x%08X (%s), file version %s: %s%s", exe, stamp, g_buildDate.c_str(),
+         g_fileVersion.empty() ? "none" : g_fileVersion.c_str(),
+         g_buildKnown ? "game version " : "not a build this version knows, trying anyway", g_buildKnown ? g_gameVersion.c_str() : "");
     const uint8_t* text = nullptr; size_t textSize = 0;
     if (!textSection(text, textSize)) { logf("FAIL: no .text section"); return false; }
     uintptr_t lo = (uintptr_t)exe, hi = lo + nt->OptionalHeader.SizeOfImage;
@@ -938,35 +980,79 @@ bool resolveAnchors() {
 bool dialogs() { return GetEnvironmentVariableW(L"GRAVITYCONTROL_NO_DIALOGS", nullptr, 0) == 0; }   // tests switch the pop-ups off
 
 // ---------------------------------------------------------------- other copies of the mod
-// 1.0 was installed flat (crmods\gravitycontrol.dll) and has no way to be told to stop. A copy from 1.1
-// on exports GravityControl_InstanceGuard and takes a mutex: the first one in the process is in charge.
-struct OtherCopy { HMODULE mod = nullptr; uintptr_t base = 0; size_t size = 0; std::wstring path; };
-struct Copies { bool second = false; std::wstring inCharge; std::vector<OtherCopy> legacy; };
+// Only one copy may act on the game, and it should be the newest one installed. A copy from 1.1 on exports
+// GravityControl_InstanceGuard and holds a mutex while it is loaded. From 1.2.2 on a copy also exports its
+// version and GravityControl_Yield, which a newer copy calls to make it step back. Older copies cannot be
+// told anything: 1.0 has no guard at all, and 1.1 to 1.2.1 never give way. A newer copy closes the message
+// such a copy may be showing and takes its hooks out of the game.
+struct OtherCopy {
+    HMODULE mod = nullptr; uintptr_t base = 0; size_t size = 0; std::wstring path;
+    bool guard = false;             // 1.1 or later
+    std::string version;            // 1.2.2 or later; empty before that
+    int (*yield)() = nullptr;       // 1.2.2 or later
+};
 
-Copies findCopies() {
-    Copies c;
+const char kVersionTag[] = "GravityControlVersion=";    // GravityControl_Version: this, the version, then ';'
+
+unsigned versionNumber(const std::string& v) {          // "1.2.2" -> 1002002; no version -> 0
+    unsigned a = 0, b = 0, c = 0;
+    sscanf_s(v.c_str(), "%u.%u.%u", &a, &b, &c);
+    return a * 1000000 + b * 1000 + c;
+}
+
+std::string versionInTag(const char* p, size_t n) {     // the text between the tag and ';'
+    size_t k = sizeof kVersionTag - 1;
+    if (n < k || memcmp(p, kVersionTag, k)) return "";
+    std::string v;
+    for (size_t i = k; i < n && i < k + 16 && p[i] && p[i] != ';'; i++) v.push_back(p[i]);
+    return v;
+}
+
+// gravitycontrol.dll, also under a changed name such as "gravitycontrol - Copy.dll"
+bool nameOfThisMod(const wchar_t* file) {
+    std::wstring s = file;
+    for (auto& ch : s) ch = (wchar_t)towlower(ch);
+    if (s.size() < 5 || s.compare(s.size() - 4, 4, L".dll")) return false;
+    return s.find(L"gravitycontrol") != std::wstring::npos || s.find(L"gravityshift") != std::wstring::npos;
+}
+
+// Takes the mutex of the copy in charge. False when another copy (1.1 or later) holds it already.
+bool claimInstance() {
     wchar_t name[64]; swprintf_s(name, L"Local\\GravityControl.Instance.%lu", GetCurrentProcessId());
-    HANDLE m = CreateMutexW(nullptr, FALSE, name);
-    c.second = m && GetLastError() == ERROR_ALREADY_EXISTS;      // a 1.1+ copy got here first
-    if (c.second) CloseHandle(m); else g_instanceMutex = m;
+    g_instanceMutex = CreateMutexW(nullptr, FALSE, name);
+    return !(g_instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS);
+}
+
+// The other copies loaded right now. Each one is pinned (its reference count raised), so it cannot unload
+// while this copy looks at it; releaseCopies() lets them go again.
+std::vector<OtherCopy> findCopies() {
+    std::vector<OtherCopy> out;
     for (int attempt = 0; attempt < 5; attempt++) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
         if (snap == INVALID_HANDLE_VALUE) { if (GetLastError() == ERROR_BAD_LENGTH) continue; break; }
         MODULEENTRY32W me; me.dwSize = sizeof me;
         if (Module32FirstW(snap, &me)) do {
-            if (me.hModule == g_self) continue;
-            if (_wcsicmp(me.szModule, L"gravitycontrol.dll") && _wcsicmp(me.szModule, L"gravityshift.dll")) continue;
-            if (GetProcAddress(me.hModule, "GravityControl_InstanceGuard")) { c.inCharge = me.szExePath; continue; }
-            OtherCopy o; o.mod = me.hModule; o.base = (uintptr_t)me.modBaseAddr; o.size = me.modBaseSize; o.path = me.szExePath;
-            c.legacy.push_back(o);
+            if (me.hModule == g_self || !nameOfThisMod(me.szModule)) continue;
+            HMODULE pinned = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)me.modBaseAddr, &pinned)) continue;     // gone already
+            if (pinned != me.hModule) { FreeLibrary(pinned); continue; }
+            OtherCopy o; o.mod = pinned; o.base = (uintptr_t)me.modBaseAddr; o.size = me.modBaseSize; o.path = me.szExePath;
+            o.guard = GetProcAddress(pinned, "GravityControl_InstanceGuard") != nullptr;
+            if (const char* tag = (const char*)GetProcAddress(pinned, "GravityControl_Version")) o.version = versionInTag(tag, 64);
+            o.yield = (int (*)())GetProcAddress(pinned, "GravityControl_Yield");
+            out.push_back(o);
         } while (Module32NextW(snap, &me));
         CloseHandle(snap);
         break;
     }
-    return c;
+    return out;
 }
 
-// True while a thread that was started inside [base, base + size) is alive: an older copy's init thread.
+void releaseCopies(std::vector<OtherCopy>& copies) {
+    for (OtherCopy& c : copies) if (c.mod) { FreeLibrary(c.mod); c.mod = nullptr; }
+}
+
+// True while a thread that was started inside [base, base + size) is alive.
 bool threadStartedIn(uintptr_t base, size_t size) {
     typedef LONG (NTAPI *QueryFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     static QueryFn query = (QueryFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread");
@@ -998,34 +1084,101 @@ bool hookedBy(const uint8_t* site, uintptr_t base, size_t size) {
     return disp == 0 && target >= base && target < base + size;
 }
 
-// An older copy is loaded: wait until it has finished starting, then put the original bytes back where it
-// hooked the game. Its hook functions are never reached again, so it stays loaded but does nothing, and
-// this copy hooks the untouched functions as usual. This runs while the game is still starting up.
-void takeOver(const OtherCopy& old) {
-    logf("an older copy is loaded (%ls): taking over from it", old.path.c_str());
-    DWORD t0 = GetTickCount();
-    while (threadStartedIn(old.base, old.size) && GetTickCount() - t0 < 120000) Sleep(100);
+// Closes message boxes of this mod in this process: this copy's own, or those of other copies (their titles
+// differ from this copy's). An older copy holds its start-up, and the player, up with a message that no
+// longer applies once a newer copy takes over.
+BOOL CALLBACK closeMessageProc(HWND w, LPARAM own) {
+    DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    wchar_t cls[16] = L"", title[64] = L"";
+    GetClassNameW(w, cls, 16); GetWindowTextW(w, title, 64);
+    if (wcscmp(cls, L"#32770") || wcsncmp(title, L"GravityControl", 14)) return TRUE;
+    if ((wcscmp(title, kTitle) == 0) == (own != 0)) PostMessageW(w, WM_CLOSE, 0, 0);      // an OK-only box closes on WM_CLOSE, not on IDOK
+    return TRUE;
+}
+void closeMessages(bool own) { EnumWindows(closeMessageProc, own ? 1 : 0); }
+
+// The four functions a copy of this mod hooks, found by their pattern from the sixth byte on: a hook
+// replaces the first five.
+struct HookSite { const Anchor* a; std::string bytes; uint8_t* site; };
+std::vector<HookSite> hookSites() {
+    std::vector<HookSite> v;
     const uint8_t* text = nullptr; size_t textSize = 0;
-    if (!textSection(text, textSize) || textSize < 64) return;
-    static const int hooked[] = { A_START, A_MPI, A_UAA, A_MENU };
-    int removed = 0;
-    for (int id : hooked) {
+    if (!textSection(text, textSize) || textSize < 64) return v;
+    for (int id : { A_START, A_MPI, A_UAA, A_MENU }) {
         const Anchor& a = g_anchors[id];
         std::string b, m; parsePattern(a.patterns[0], b, m);
-        // the hook overwrote the first 5 bytes: find the function by the rest of its pattern
         int count = 0; uintptr_t off = findPattern(text + 5, textSize - 5, b.substr(5), m.substr(5), count);
-        if (count != 1) { logf("takeover: %s not found (%d matches)", a.name, count); continue; }
-        uint8_t* site = (uint8_t*)text + off;
-        if (memcmp(site, b.data(), 5) == 0) continue;                       // not hooked
-        if (!hookedBy(site, old.base, old.size)) { logf("takeover: %s is hooked by something else; left alone", a.name); continue; }
+        v.push_back({ &a, b, count == 1 ? (uint8_t*)text + off : nullptr });
+    }
+    return v;
+}
+
+// Where another copy stands: its hooks are in the game, or all its threads have ended (it switched itself
+// off), or it is still starting.
+enum CopyState { COPY_STARTING, COPY_ACTIVE, COPY_FINISHED };
+CopyState copyState(const OtherCopy& c, const std::vector<HookSite>& sites) {
+    for (const HookSite& s : sites) if (s.site && hookedBy(s.site, c.base, c.size)) return COPY_ACTIVE;
+    return threadStartedIn(c.base, c.size) ? COPY_STARTING : COPY_FINISHED;
+}
+
+// The five bytes a function started with before a copy of this mod hooked it. MinHook keeps the displaced
+// code in a 64-byte slot that also holds the relay the hook jumps through: when that code is a jump, the
+// function had already been hooked by another mod, and that mod's jump goes back in; otherwise the game's
+// own first bytes do.
+bool bytesBefore(const uint8_t* site, const std::string& pattern, uint8_t out[5]) {
+    int32_t rel; memcpy(&rel, site + 1, 4);
+    const uint8_t* slot = (const uint8_t*)(((uintptr_t)site + 5 + rel) & ~(uintptr_t)63);
+    uintptr_t dest = 0;
+    if (readable(slot, 14) && jumpAt(slot, dest) == 14) {
+        int64_t d = (int64_t)dest - (int64_t)((uintptr_t)site + 5);
+        if (d != (int32_t)d) return false;
+        out[0] = 0xE9; int32_t r = (int32_t)d; memcpy(out + 1, &r, 4);
+        return true;
+    }
+    memcpy(out, pattern.data(), 5);
+    return true;
+}
+
+// An older copy that cannot be asked to yield (1.0 to 1.2.1) is loaded. If it is showing a message, that is
+// closed; if it switched itself off, nothing more is needed; if it is active, its hooks are taken out of the
+// game. Its hook functions are never reached again then, so it stays loaded but does nothing. False when it
+// has to be left in charge: another mod hooked a function after it, so its hook cannot be reached.
+bool supersede(const OtherCopy& old) {
+    logf("an older copy is loaded (%ls): this copy takes its place", old.path.c_str());
+    DWORD t0 = GetTickCount();
+    std::vector<HookSite> sites = hookSites();
+    CopyState state;
+    for (;;) {
+        closeMessages(false);
+        state = copyState(old, sites);
+        if (state != COPY_STARTING || GetTickCount() - t0 > 20000) break;
+        Sleep(50);
+    }
+    closeMessages(false);
+    if (state == COPY_FINISHED) { logf("takeover: the older copy had switched itself off (%lu ms)", GetTickCount() - t0); return true; }
+    if (state == COPY_STARTING) { logf("takeover: the older copy did not finish starting in 20 s; it is left alone"); return false; }
+    struct Fix { uint8_t* site; uint8_t bytes[5]; };
+    std::vector<Fix> fixes;
+    for (const HookSite& s : sites) {
+        if (!s.site) { logf("takeover: %s not found", s.a->name); continue; }
+        if (memcmp(s.site, s.bytes.data(), 5) == 0) continue;                    // not hooked
+        Fix f; f.site = s.site;
+        if (hookedBy(s.site, old.base, old.size) && bytesBefore(s.site, s.bytes, f.bytes)) { fixes.push_back(f); continue; }
+        logf("takeover: %s is hooked by another mod on top of the older copy", s.a->name);
+        if (s.a->required) { logf("takeover: the older copy's hooks cannot be taken out cleanly; it is left alone"); return false; }
+    }
+    int removed = 0;
+    for (const Fix& f : fixes) {
         DWORD prot = 0;
-        if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &prot)) { logf("takeover: cannot write at %s (error %lu)", a.name, GetLastError()); continue; }
-        memcpy(site, b.data(), 5);
-        VirtualProtect(site, 5, prot, &prot);
-        FlushInstructionCache(GetCurrentProcess(), site, 5);
+        if (!VirtualProtect(f.site, 5, PAGE_EXECUTE_READWRITE, &prot)) { logf("takeover: cannot write at %p (error %lu)", f.site, GetLastError()); continue; }
+        memcpy(f.site, f.bytes, 5);
+        VirtualProtect(f.site, 5, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), f.site, 5);
         removed++;
     }
     logf("takeover: removed %d hook(s) of the older copy after %lu ms; it stays loaded but does nothing", removed, GetTickCount() - t0);
+    return removed == (int)fixes.size();
 }
 
 bool fileExists(const std::wstring& f) { return GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES; }
@@ -1066,6 +1219,56 @@ void retireFlatInstall() {
     }
 }
 
+std::string readFile(const std::wstring& path, size_t limit) {
+    std::string data;
+    FILE* fp = nullptr;
+    if (_wfopen_s(&fp, path.c_str(), L"rb") || !fp) return data;
+    char buf[65536]; size_t n;
+    while (data.size() < limit && (n = fread(buf, 1, sizeof buf, fp)) > 0) data.append(buf, n);
+    fclose(fp);
+    return data;
+}
+
+// Any other copy of this mod's DLL below `dir` that is not newer than this one gets ".old" on the end,
+// together with the menu file next to it: two menu files with one id make Mod Settings Menu drop both.
+void retireCopiesIn(const std::wstring& dir, int depth, const std::wstring& self) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        std::wstring path = dir + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth < 4 && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) retireCopiesIn(path + L"\\", depth + 1, self);
+            continue;
+        }
+        if (!nameOfThisMod(fd.cFileName) || !_wcsicmp(path.c_str(), self.c_str())) continue;
+        std::string data = readFile(path, 8u << 20);
+        if (data.find("GravityControl_ThirdPartyNotices") == std::string::npos) continue;      // some other file with a similar name
+        std::string v;
+        for (size_t at = data.find(kVersionTag); at != std::string::npos && v.empty(); at = data.find(kVersionTag, at + 1))
+            v = versionInTag(data.data() + at, data.size() - at);
+        if (versionNumber(v) > versionNumber(kVersion)) {
+            logf("copies: a newer version (%s) is installed at %ls; it takes over when it loads", v.c_str(), path.c_str());
+            continue;
+        }
+        logf("copies: %ls is another copy of this mod (%s); renaming it so that only this copy loads", path.c_str(), v.empty() ? "1.2.1 or older" : v.c_str());
+        renameOld(path, "DLL");
+        renameOld(dir + L"gravitycontrol.menu.json", "menu file");
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// Looks through the crmods folder this copy is in for other copies of the mod, loaded or not.
+void retireOtherCopies() {
+    std::wstring lower = g_dir;
+    for (auto& ch : lower) ch = (wchar_t)towlower(ch);
+    size_t p = lower.find(L"\\crmods\\");
+    if (p == std::wstring::npos) return;
+    wchar_t self[MAX_PATH] = L""; GetModuleFileNameW(g_self, self, MAX_PATH);
+    retireCopiesIn(g_dir.substr(0, p + 8), 0, self);
+}
+
 // Nothing of ours is hooked yet: leave the process, so Mod Settings Menu shows the mod as not loaded
 // instead of "Running".
 DWORD unloadSelf() {
@@ -1075,7 +1278,7 @@ DWORD unloadSelf() {
     return 0;
 }
 
-bool padWanted() { return g_cfg.enabled && g_cfg.padEnabled && g_cfg.padButton; }
+bool padWanted() { return g_cfg.enabled && g_cfg.padEnabled && g_cfg.padButton && !g_yielded; }
 bool padVerbose() { return g_cfg.diagnostics != 0; }
 DWORD WINAPI hidThread(LPVOID) { sonypad::run(g_hidButtons, padWanted, padVerbose, logf); return 0; }
 DWORD WINAPI xinputThread(LPVOID) {
@@ -1091,23 +1294,122 @@ DWORD WINAPI xinputThread(LPVOID) {
     }
 }
 
+// ---------------------------------------------------------------- what a bug report needs
+// Where the game came from and which other mod files are loaded, as far as this copy can see. Written once,
+// when the mod has either started or given up: by then the mod loader has loaded everything.
+void logEnvironment() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    wchar_t exe[MAX_PATH] = L""; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring game = exe; game = game.substr(0, game.find_last_of(L"\\/") + 1);
+    const char* store = GetModuleHandleW(L"steam_api64.dll") ? "Steam (steam_api64.dll is loaded)"
+                      : GetModuleHandleW(L"EOSSDK-Win64-Shipping.dll") ? "Epic Games Store (EOSSDK-Win64-Shipping.dll is loaded)"
+                      : GetModuleHandleW(L"Galaxy64.dll") ? "GOG (Galaxy64.dll is loaded)"
+                      : wcsstr(exe, L"\\WindowsApps\\") ? "Microsoft Store (the game is under WindowsApps)"
+                      : "not recognised (no Steam, Epic or GOG library is loaded)";
+    logf("platform: %s; game folder %ls", store, game.c_str());
+    // DLLs in the game folder under these names stand in for Windows libraries: mod loaders, ReShade and the like
+    static const wchar_t* proxies[] = { L"winmm.dll", L"version.dll", L"dinput8.dll", L"dxgi.dll", L"d3d11.dll", L"d3d12.dll", L"dwmapi.dll",
+                                        L"winhttp.dll", L"wininet.dll", L"dsound.dll", L"xinput1_3.dll", L"xinput1_4.dll", L"xinput9_1_0.dll",
+                                        L"opengl32.dll", L"dbghelp.dll" };
+    std::vector<std::wstring> mods;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+        if (snap == INVALID_HANDLE_VALUE) { if (GetLastError() == ERROR_BAD_LENGTH) continue; break; }
+        MODULEENTRY32W me; me.dwSize = sizeof me;
+        if (Module32FirstW(snap, &me)) do {
+            if (me.hModule == g_self || !_wcsicmp(me.szExePath, exe) || _wcsnicmp(me.szExePath, game.c_str(), game.size())) continue;
+            std::wstring rel = me.szExePath + game.size(), low = rel;
+            for (auto& ch : low) ch = (wchar_t)towlower(ch);
+            size_t dot = low.find_last_of(L'.');
+            std::wstring ext = dot == std::wstring::npos ? L"" : low.substr(dot);
+            bool mod = low.compare(0, 7, L"crmods\\") == 0 || ext == L".asi" || ext == L".addon64" || ext == L".addon";
+            if (low.find(L'\\') == std::wstring::npos) for (const wchar_t* p : proxies) if (low == p) mod = true;
+            if (!mod) continue;
+            WIN32_FILE_ATTRIBUTE_DATA fa{}; SYSTEMTIME st{};
+            wchar_t line[MAX_PATH + 80];
+            if (GetFileAttributesExW(me.szExePath, GetFileExInfoStandard, &fa) && FileTimeToSystemTime(&fa.ftLastWriteTime, &st))
+                swprintf_s(line, L"%s (%lu bytes, %04u-%02u-%02u)", rel.c_str(), fa.nFileSizeLow, st.wYear, st.wMonth, st.wDay);
+            else swprintf_s(line, L"%s (renamed or removed since it was loaded)", rel.c_str());
+            mods.push_back(line);
+        } while (Module32NextW(snap, &me));
+        CloseHandle(snap);
+        break;
+    }
+    logf("other mod files loaded: %d%s", (int)mods.size(),
+         mods.empty() ? "" : " (everything under crmods, .asi files, ReShade add-ons, and stand-in DLLs in the game folder)");
+    for (const std::wstring& m : mods) logf("  %ls", m.c_str());
+}
+
+// ---------------------------------------------------------------- messages
+std::wstring wide(const std::string& s) { return std::wstring(s.begin(), s.end()); }       // plain ASCII only
+
+// The "Problem:" line as far as the anchors tell it: functions not found, functions another mod rewrote.
+std::wstring anchorProblems() {
+    std::wstring missing, changed; int nMissing = 0, nChanged = 0;
+    for (const Anchor& a : g_anchors) {
+        if (a.found) continue;
+        std::wstring& list = a.changed ? changed : missing;
+        if ((a.changed ? nChanged : nMissing)++) list += L", ";
+        list += L"\"" + wide(a.name) + L"\"";
+    }
+    std::wstring out;
+    if (nMissing) out = (nMissing > 1 ? L"game functions " : L"game function ") + missing + L" not found";
+    if (nChanged) out += (out.empty() ? L"" : L"; ") + std::wstring(nChanged > 1 ? L"game functions " : L"game function ") + changed +
+                         (nChanged > 1 ? L" were rewritten by another mod" : L" was rewritten by another mod");
+    return out;
+}
+
+// Why game code is missing or changed, as far as this copy can tell. A function that is missing in a game
+// version the mod was checked on has been changed in memory: that is another mod or tool, not an update.
+std::wstring causeText() {
+    bool missing = false, changed = false;
+    for (const Anchor& a : g_anchors) if (!a.found) (a.changed ? changed : missing) = true;
+    if (changed) return L"Another mod or tool has changed game code that GravityControl needs, in a way the two cannot share. "
+                        L"Try the game without your other mods to find out which one.\n\n";
+    if (!missing) return L"";
+    if (g_buildKnown) return L"GravityControl supports this game version, so a game update is not the cause. Most likely another mod or tool "
+                             L"has changed the game code GravityControl needs. Try the game without your other mods to find out which one.\n\n";
+    return L"GravityControl " + wide(kVersion) + L" does not know this game version. A game update has probably changed the code the mod "
+           L"needs: look for a newer version of GravityControl first.\n\n";
+}
+
 const wchar_t kStopMessage[] = L"To stop this message, set VersionWarning=0 in gravitycontrol_config.ini, or switch it off under Options > MODS.";
 
-// The mod cannot run here: say so (unless told not to) and leave the process. otherMod: the game code is
-// there, but another mod rewrote it; otherwise a game update is the likely reason.
-DWORD standDown(const char* why, bool otherMod = false) {
-    logf("GravityControl inactive: %s; the game runs unmodified", why);
-    if (g_cfg.versionWarning && dialogs()) {
-        std::wstring msg = otherMod
-            ? L"Another mod has changed game code that GravityControl needs, in a way GravityControl cannot work with, so GravityControl is "
-              L"switched off. The game itself is not affected.\n\n"
-              L"Try without your other mods to find out which one it is.\n\n"
-            : L"GravityControl could not hook this version of the game, so it is switched off. The game itself is not affected.\n\n"
-              L"A game update probably changed the code the mod relies on. Look for a newer version of GravityControl. "
-              L"Another mod that changes the same game code can cause this too.\n\n";
-        msg += L"Details are in gravitycontrol.log, next to the mod. ";
-        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), kTitle, MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+// The one message box of this mod: what happened, the versions, the problem, the likely cause and what a
+// report should contain. The text goes into the log as well, shown or not.
+void showMessage(const std::wstring& what, const std::wstring& problem) {
+    std::wstring game = g_buildKnown ? wide(g_gameVersion) : L"unknown to this mod";
+    if (!g_fileVersion.empty()) game += L" (file version " + wide(g_fileVersion) + L")";
+    std::wstring msg = what + L"\n\n"
+        L"Mod version: " + wide(kVersion) + L"\n"
+        L"Game version: " + game + L"\n"
+        L"Game build date: " + wide(g_buildDate) + L"\n"
+        L"Problem: " + problem + L"\n\n" +
+        causeText() +
+        L"If you report this, please include:\n"
+        L"- this message (Ctrl+C copies it)\n"
+        L"- where you got the game: Steam, Epic or other\n"
+        L"- the other mods you use\n"
+        L"- the text of gravitycontrol.log, in crmods\\GravityControl\n\n" +
+        kStopMessage;
+    bool show = g_cfg.versionWarning && dialogs();
+    logf("message%s:", show ? "" : g_cfg.versionWarning ? " (not shown: dialogs are off)" : " (not shown: VersionWarning=0)");
+    for (size_t a = 0; a < msg.size(); ) {
+        size_t b = msg.find(L'\n', a);
+        if (b == std::wstring::npos) b = msg.size();
+        logf("  | %ls", msg.substr(a, b - a).c_str());
+        a = b + 1;
     }
+    if (show) MessageBoxW(nullptr, msg.c_str(), kTitle, MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+}
+
+// The mod cannot run here: say so (unless told not to) and leave the process.
+DWORD standDown(const char* why, const std::wstring& problem) {
+    logf("GravityControl inactive: %s; the game runs unmodified", why);
+    logEnvironment();
+    showMessage(L"GravityControl is switched off for this session. The game itself is not affected.", problem);
     return unloadSelf();
 }
 
@@ -1123,19 +1425,34 @@ void logShared(int id, const void* orig) {
 DWORD WINAPI initThread(LPVOID) {
     loadSettings();
     logSettings();
-    Copies copies = findCopies();
-    if (copies.second) {
-        // Another 1.1+ copy is in charge (it loaded first). This one only tidies up and leaves.
+    bool first = claimInstance();
+    std::vector<OtherCopy> copies = findCopies();
+    unsigned mine = versionNumber(kVersion);
+    for (const OtherCopy& c : copies) {
+        unsigned theirs = versionNumber(c.version);
+        if (!c.guard || theirs < mine || (theirs == mine && first)) continue;
+        // A newer copy, or the same version that loaded first, is in charge. This one only tidies up and leaves.
         retireFlatInstall();
-        logf("inactive: another copy of GravityControl is already in charge (%ls)", copies.inCharge.c_str());
+        logf("inactive: %s copy of GravityControl is in charge (%s, %ls)", theirs > mine ? "a newer" : "another", c.version.c_str(), c.path.c_str());
+        releaseCopies(copies);
         return unloadSelf();
     }
-    for (const OtherCopy& old : copies.legacy) takeOver(old);
+    bool blocked = false;
+    for (const OtherCopy& c : copies) {
+        if (c.yield) { c.yield(); logf("copies: %ls (%s) has stepped back for this copy", c.path.c_str(), c.version.c_str()); }
+        else if (!supersede(c)) blocked = true;
+    }
+    releaseCopies(copies);
     retireFlatInstall();
+    retireOtherCopies();
+    if (blocked) {
+        logf("inactive: an older copy stays in charge for this session; its files are renamed, so this copy runs from the next start");
+        return unloadSelf();
+    }
     if (!resolveAnchors())
-        return g_otherMod ? standDown("another mod rewrote a function it needs", true)
-                          : standDown("a hook point it needs was not found in this game build");
-    if (MH_Initialize() != MH_OK) return standDown("the hooking library did not start");
+        return standDown(g_otherMod ? "another mod rewrote a function it needs" : "a hook point it needs was not found in this game build", anchorProblems());
+    if (g_yielded) { logf("inactive: a newer copy of GravityControl took over while this one was starting"); return unloadSelf(); }
+    if (MH_Initialize() != MH_OK) return standDown("the hooking library did not start", L"the hooking library did not start");
     {
         HMODULE xi = LoadLibraryW(L"xinput1_4.dll");
         if (!xi) xi = LoadLibraryW(L"xinput9_1_0.dll");
@@ -1149,7 +1466,11 @@ DWORD WINAPI initThread(LPVOID) {
     if (MH_CreateHook((void*)g_anchors[A_START].found, (void*)hkStart, (void**)&g_origStart) != MH_OK) failed = "start_helper";
     else if (MH_CreateHook((void*)g_anchors[A_MPI].found, (void*)hkBody, (void**)&g_origBody) != MH_OK) failed = "mpi_body";
     else if (MH_CreateHook((void*)g_anchors[A_UAA].found, (void*)hkUaa, (void**)&g_origUaa) != MH_OK) failed = "uaa_body";
-    if (failed) { logf("FAIL: hook %s", failed); MH_Uninitialize(); return standDown("a hook could not be created"); }
+    if (failed) {
+        logf("FAIL: hook %s", failed);
+        MH_Uninitialize();
+        return standDown("a hook could not be created", L"could not hook game function \"" + wide(failed) + L"\"");
+    }
     bool menuHook = g_anchors[A_MENU].found &&
                     MH_CreateHook((void*)g_anchors[A_MENU].found, (void*)hkMenu, (void**)&g_origMenu) == MH_OK;   // optional
     logShared(A_START, (const void*)g_origStart); logShared(A_MPI, (const void*)g_origBody); logShared(A_UAA, (const void*)g_origUaa);
@@ -1157,33 +1478,33 @@ DWORD WINAPI initThread(LPVOID) {
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
         // some hooks may already be live, so this copy stays loaded
         logf("FAIL: enable hooks; GravityControl may not work in this session");
-        if (g_cfg.versionWarning && dialogs())
-            MessageBoxW(nullptr, (std::wstring(L"GravityControl could not switch its hooks on in this version of the game and may not work.\n\n"
-                                               L"Details are in gravitycontrol.log, next to the mod. ") + kStopMessage).c_str(),
-                        kTitle, MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+        logEnvironment();
+        showMessage(L"GravityControl could not switch its hooks on and may not work in this session. The game itself is not affected.",
+                    L"the hooks could not be switched on");
         return 0;
     }
     CreateThread(nullptr, 0, hidThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, xinputThread, nullptr, 0, nullptr);
     logf("active: GravityControl %s - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
          kVersion, g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0);
-    // Parts that had to be left out in this game build. Only the ones a player would notice get a message.
+    // Parts that had to be left out here. Only the ones a player would notice get a message.
     std::wstring off;
     if (!g_isUnlocked) {
         logf("reduced: the Gravity Anomaly unlock check is unavailable; RequireAnomalyUnlocked cannot be enforced, shifting is allowed");
-        off += L"  - the Gravity Anomaly unlock check: gravity can be shifted before the ability is unlocked\n";
+        off += L"- the Gravity Anomaly unlock check: gravity can be shifted before the ability is unlocked\n";
     }
     if (!menuHook) {
         logf("reduced: the game-menu state is unavailable; the key and button are not ignored while a menu is open");
-        off += L"  - ignoring the key and button while a game menu is open\n";
+        off += L"- ignoring the key and button while a game menu is open\n";
     }
     if (!g_typeLookup) logf("reduced: the physics layer lookup is unavailable; the ray filters the player by entity id only");
     if (!g_matrix) logf("reduced: the layer matrix was not found; [Blockers] IgnoreLayers does nothing");
     if (off.empty()) logf(g_buildKnown ? "all hook points found" : "all hook points found in a game build this version does not know: no message is shown");
-    else if (g_cfg.versionWarning && dialogs()) {
-        std::wstring msg = L"GravityControl is running, but this version of the game changed some of the code it relies on. Switched off:\n\n" + off +
-                           L"\nEverything else works. Look for a newer version of GravityControl.\n\n";
-        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), kTitle, MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+    logEnvironment();
+    if (!off.empty()) {
+        std::wstring problem = anchorProblems();
+        if (g_anchors[A_MENU].found && !menuHook) problem += (problem.empty() ? L"" : L"; ") + std::wstring(L"could not hook game function \"menu_broadcast\"");
+        showMessage(L"GravityControl is running, but these parts are switched off:\n" + off + L"Everything else works.", problem);
     }
     return 0;
 }
@@ -1192,6 +1513,18 @@ DWORD WINAPI initThread(LPVOID) {
 
 // Marks a copy that guards against a second instance (1.1 and later); see findCopies().
 extern "C" __declspec(dllexport) const int GravityControl_InstanceGuard = 1;
+
+// The version of this copy, for another copy to read from the loaded module or from the file (1.2.2 and later).
+extern "C" __declspec(dllexport) const char GravityControl_Version[] = "GravityControlVersion=" GC_VERSION ";";
+
+// Called by a newer copy that loaded after this one (1.2.2 and later): this copy stops acting. Its hooks stay
+// where they are and only pass the game's calls on, so nothing in the game's code has to be changed back.
+extern "C" __declspec(dllexport) int GravityControl_Yield() {
+    g_yielded = true;
+    logf("a newer copy of GravityControl took over: this copy only passes the game's calls on from now");
+    closeMessages(true);
+    return 1;
+}
 
 // Third-party notices, embedded in the binary (BSD-2-Clause requires them with binary distributions).
 extern "C" __declspec(dllexport) const char GravityControl_ThirdPartyNotices[] =

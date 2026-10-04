@@ -19,11 +19,13 @@ the `winmm.dll` mod loader, which you already have if you run other DLL mods. Fu
 [README-GravityControl.txt](README-GravityControl.txt).
 
 Upgrading from 1.0: just extract. On its first start the mod takes over from the old flat files in
-`crmods\` and renames them with `.old` on the end. Nothing is deleted.
+`crmods\` and renames them with `.old` on the end. Nothing is deleted. The same goes for any older
+copy elsewhere in `crmods`: the newest copy runs, and the older one's DLL and menu file get `.old`.
 
 Checked on Steam build 25472515 and on game versions 1.4.0 and 1.4.1. After a later update the
 mod still runs if the code it needs is unchanged. It shows a message only when an update stops the
-mod, or part of it, from working. It works next to other mods that hook the same game functions.
+mod, or part of it, from working: the message names the mod and game versions, the game function that
+failed and the likely cause. It works next to other mods that hook the same game functions.
 
 ## Build
 
