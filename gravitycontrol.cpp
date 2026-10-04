@@ -1,4 +1,4 @@
-// GravityControl 1.2 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515 and the 2026-10-01 update).
+// GravityControl 1.2.1 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515 up to game version 1.4.1).
 //
 // How it works (see _modding-research/NOTES.md):
 //   The player's "down" is the quaternion in coregame::component::MovementPlane. The game's own
@@ -31,6 +31,9 @@
 #include "sonypad.h"
 
 namespace {
+
+const char kVersion[] = "1.2.1";
+const wchar_t kTitle[] = L"GravityControl 1.2.1";       // title of the message boxes
 
 // ---------------------------------------------------------------- small math
 struct Quat { float x, y, z, w; };
@@ -216,8 +219,13 @@ void logSettings() {
 // ---------------------------------------------------------------- game functions
 // Byte patterns of function prologues; each must be found exactly once in .text. An anchor may carry the
 // pattern of more than one game build (the first that matches wins). The mod cannot run without the
-// required ones; a missing optional one only switches its part of the mod off.
-struct Anchor { const char* name; bool required; const char* patterns[2]; uintptr_t found; };
+// required ones; a missing optional one only switches its part of the mod off. A function that another mod
+// hooked first no longer starts with its pattern; it is found by the rest of it (findHooked).
+struct Anchor {
+    const char* name; bool required; const char* patterns[2]; uintptr_t found;
+    std::string sharedWith;     // set when another mod's hook was already on the function: that mod's file name
+    bool changed;               // the function is there, but its start was rewritten in a way this mod cannot share
+};
 Anchor g_anchors[] = {
     { "mpi_body", true,
                     { "4c 8b dc 4d 89 4b 20 4d 89 43 18 49 89 53 10 53 56 57 41 54 41 55 41 56 41 57 48 81 ec e0 02 00",
@@ -449,6 +457,24 @@ bool readable(const void* p, size_t n) {
     if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS)) return false;
     return (uintptr_t)p + n <= (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
 }
+
+// Length of a jump written over a function start, in the forms hook libraries use (0 = none of them), and
+// where it goes.
+size_t jumpAt(const uint8_t* p, uintptr_t& target) {
+    if (p[0] == 0xE9) { int32_t rel; memcpy(&rel, p + 1, 4); target = (uintptr_t)p + 5 + rel; return 5; }             // jmp rel32
+    if (p[0] == 0xFF && p[1] == 0x25 && !p[2] && !p[3] && !p[4] && !p[5]) { memcpy(&target, p + 6, 8); return 14; }   // jmp [rip+0], address
+    if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) { memcpy(&target, p + 2, 8); return 12; }     // mov rax, address; jmp rax
+    if (p[0] == 0x49 && p[1] == 0xBB && p[10] == 0x41 && p[11] == 0xFF && p[12] == 0xE3) { memcpy(&target, p + 2, 8); return 13; }   // mov r11, address; jmp r11
+    return 0;
+}
+
+// True while the function at `site` still starts with this mod's own jump to `hook` (MinHook: jmp rel32 to
+// a relay that holds "jmp [rip+0], hook").
+bool ownHook(const uint8_t* site, const void* hook) {
+    uintptr_t relay = 0, dest = 0;
+    return site && jumpAt(site, relay) == 5 && readable((const void*)relay, 14) &&
+           jumpAt((const uint8_t*)relay, dest) == 14 && dest == (uintptr_t)hook;
+}
 std::vector<std::pair<int, int>> g_cleared;   // (hi, lo) matrix bits we cleared, for restoring
 void setMatrixBit(int a, int b, bool on) {
     int hi = a > b ? a : b, lo = a > b ? b : a;
@@ -492,7 +518,11 @@ int anomalyUnlocked() {
 void requestShift(uint8_t (*b)[32], void* scene) {
     if (g_cfg.requireUnlock && g_isUnlocked) {
         int u = anomalyUnlocked();
-        if (u < 0) { logf("shift refused: cannot check the Gravity Anomaly unlock yet (the game's anomaly update has not run)"); return; }
+        if (u < 0) {
+            logf("shift refused: cannot check the Gravity Anomaly unlock yet (the game's anomaly update has not run; this mod's hook on it is %s)",
+                 ownHook((const uint8_t*)g_anchors[A_UAA].found, (const void*)hkUaa) ? "in place" : "no longer first on the function: another mod hooked or restored it");
+            return;
+        }
         if (u == 0) { logf("shift refused: the Gravity Anomaly ability (id %d) is not unlocked in this save", kAbilityId); return; }
     }
     // Column pointers of the interpolation view, in the system's signature order (4 per 32-byte block).
@@ -764,7 +794,8 @@ uintptr_t findPattern(const uint8_t* base, size_t size, const std::string& bytes
 // Game builds this version was checked on, by PE timestamp. Any other build is tried all the same: the
 // patterns decide whether the mod can run, not the timestamp.
 const DWORD kKnownBuilds[] = { 0x6AB107A0,      // Steam build 25472515
-                               0x6ABA5BB8 };    // update of 2026-10-01 (changelist 5642085)
+                               0x6ABA5BB8,      // game 1.4.0, the update of 2026-10-01 (changelist 5642085)
+                               0x6ABEF018 };    // game 1.4.1, Steam build 25673981 (changelist 5644780)
 bool g_buildKnown = false;
 
 // The image the anchors are looked up in: this process's exe. A test can name a game exe to map as data
@@ -789,6 +820,60 @@ bool textSection(const uint8_t*& text, size_t& size) {
     return false;
 }
 
+// Another mod may have hooked a function before this one looked for it. Its first bytes are then a jump out
+// of the game image, so the pattern does not match there any more. Such a function is found by its pattern
+// from kHookHead on, and MinHook chains onto the jump that is there: this mod runs first, then the other.
+const size_t kHookHead = 16;      // bytes at a function start that another mod's jump may have replaced
+bool g_otherMod = false;          // a required function is there, but rewritten in a way this mod cannot share
+
+// Counts the places where the pattern matches from kHookHead on and the start is a jump that leaves the game
+// image [lo, hi); site and target describe the first. `tails` counts every place the rest of the pattern
+// matches, and `odd` is one of them whose start is no such jump.
+int findHooked(const uint8_t* text, size_t size, const std::string& bytes, const std::string& mask, uintptr_t lo, uintptr_t hi,
+               uintptr_t& site, uintptr_t& target, const uint8_t*& odd, int& tails) {
+    int count = 0; tails = 0; odd = nullptr;
+    size_t n = bytes.size();
+    if (n < kHookHead + 8) return 0;
+    for (size_t i = 0; i + n <= size; i++) {
+        size_t k = kHookHead;
+        for (; k < n; k++) if (mask[k] == 'x' && text[i + k] != (uint8_t)bytes[k]) break;
+        if (k < n) continue;
+        tails++;
+        const uint8_t* p = text + i; uintptr_t t = 0;
+        size_t len = jumpAt(p, t);
+        bool hooked = len && (t < lo || t >= hi);
+        // what the jump left of the function start is still the pattern, or the filler some hook libraries write
+        for (size_t j = len; hooked && j < kHookHead; j++)
+            if (mask[j] == 'x' && p[j] != (uint8_t)bytes[j] && p[j] != 0x90 && p[j] != 0xCC) hooked = false;
+        if (!hooked) { odd = p; continue; }
+        if (!count) { site = (uintptr_t)p; target = t; }
+        count++;
+    }
+    return count;
+}
+
+// File name of the module a hook jump leads to. A hook library's jump goes to a relay outside any module
+// first, which jumps on to the hook function.
+std::string hookOwner(uintptr_t target) {
+    for (int hop = 0; hop < 3; hop++) {
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)target, &mod) && mod) {
+            wchar_t path[MAX_PATH] = L"";
+            GetModuleFileNameW(mod, path, MAX_PATH);
+            const wchar_t* name = wcsrchr(path, L'\\');
+            name = name ? name + 1 : path;
+            char out[MAX_PATH * 3] = "";
+            WideCharToMultiByte(CP_UTF8, 0, name, -1, out, sizeof out, nullptr, nullptr);
+            if (out[0]) return out;
+            break;
+        }
+        uintptr_t next = 0;
+        if (!readable((const void*)target, 16) || !jumpAt((const uint8_t*)target, next)) break;
+        target = next;
+    }
+    return "another mod";
+}
+
 // Looks every anchor up. Returns false when a required one is missing; a missing optional one just stays 0.
 bool resolveAnchors() {
     HMODULE exe = gameImage();
@@ -799,6 +884,7 @@ bool resolveAnchors() {
          g_buildKnown ? "a build this version was checked on" : "not a build this version knows, trying anyway");
     const uint8_t* text = nullptr; size_t textSize = 0;
     if (!textSection(text, textSize)) { logf("FAIL: no .text section"); return false; }
+    uintptr_t lo = (uintptr_t)exe, hi = lo + nt->OptionalHeader.SizeOfImage;
     bool ok = true;
     for (auto& a : g_anchors) {
         int most = 0, which = 0;
@@ -810,8 +896,31 @@ bool resolveAnchors() {
             if (count == 1) { a.found = (uintptr_t)text + off; break; }
             if (count > most) most = count;
         }
-        if (a.found) logf("anchor %s at rva 0x%llx (pattern %d)", a.name, (unsigned long long)(a.found - (uintptr_t)exe), which);
-        else {
+        const uint8_t* odd = nullptr;
+        if (!a.found && !most) {
+            // not there as the game ships it: look for it behind another mod's hook
+            which = 0;
+            for (const char* pat : a.patterns) {
+                if (!pat) continue;
+                which++;
+                std::string b, m; parsePattern(pat, b, m);
+                uintptr_t site = 0, target = 0; const uint8_t* o = nullptr; int tails = 0;
+                int n = findHooked(text, textSize, b, m, lo, hi, site, target, o, tails);
+                if (n == 1) { a.found = site; a.sharedWith = hookOwner(target); break; }
+                if (n == 0 && tails == 1 && !odd) odd = o;
+            }
+        }
+        if (a.found && a.sharedWith.empty()) logf("anchor %s at rva 0x%llx (pattern %d)", a.name, (unsigned long long)(a.found - (uintptr_t)exe), which);
+        else if (a.found) logf("anchor %s at rva 0x%llx (pattern %d), behind a hook of %s", a.name, (unsigned long long)(a.found - (uintptr_t)exe), which, a.sharedWith.c_str());
+        else if (odd) {
+            char hex[kHookHead * 3 + 1] = "";
+            for (size_t i = 0; i < kHookHead; i++) sprintf_s(hex + i * 3, 4, "%02x ", odd[i]);
+            hex[kHookHead * 3 - 1] = 0;
+            logf("FAIL: %s anchor %s is at rva 0x%llx, but it starts with \"%s\": rewritten by another mod or tool in a way this mod cannot share",
+                 a.required ? "required" : "optional", a.name, (unsigned long long)((uintptr_t)odd - (uintptr_t)exe), hex);
+            a.changed = true;
+            if (a.required) { ok = false; g_otherMod = true; }
+        } else {
             logf("FAIL: %s anchor %s not found (%d matches); the game code changed", a.required ? "required" : "optional", a.name, most);
             if (a.required) ok = false;
         }
@@ -820,7 +929,6 @@ bool resolveAnchors() {
         const uint8_t* lea = (const uint8_t*)g_anchors[A_LAYERS].found + 59;     // lea rdx, [rip + matrix]
         int32_t disp; memcpy(&disp, lea + 3, 4);
         g_matrix = (uint64_t*)(lea + 7 + disp);
-        uintptr_t lo = (uintptr_t)exe, hi = lo + nt->OptionalHeader.SizeOfImage;
         if ((uintptr_t)g_matrix < lo || (uintptr_t)g_matrix + 64 * 8 > hi) g_matrix = nullptr;      // must lie inside the game image
         else logf("layer matrix at rva 0x%llx", (unsigned long long)((uintptr_t)g_matrix - lo));
     }
@@ -985,16 +1093,31 @@ DWORD WINAPI xinputThread(LPVOID) {
 
 const wchar_t kStopMessage[] = L"To stop this message, set VersionWarning=0 in gravitycontrol_config.ini, or switch it off under Options > MODS.";
 
-// The mod cannot run in this game build: say so (unless told not to) and leave the process.
-DWORD standDown(const char* why) {
+// The mod cannot run here: say so (unless told not to) and leave the process. otherMod: the game code is
+// there, but another mod rewrote it; otherwise a game update is the likely reason.
+DWORD standDown(const char* why, bool otherMod = false) {
     logf("GravityControl inactive: %s; the game runs unmodified", why);
     if (g_cfg.versionWarning && dialogs()) {
-        std::wstring msg = L"GravityControl could not hook this version of the game, so it is switched off. The game itself is not affected.\n\n"
-                           L"A game update probably changed the code the mod relies on. Look for a newer version of GravityControl.\n\n"
-                           L"Details are in gravitycontrol.log, next to the mod. ";
-        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+        std::wstring msg = otherMod
+            ? L"Another mod has changed game code that GravityControl needs, in a way GravityControl cannot work with, so GravityControl is "
+              L"switched off. The game itself is not affected.\n\n"
+              L"Try without your other mods to find out which one it is.\n\n"
+            : L"GravityControl could not hook this version of the game, so it is switched off. The game itself is not affected.\n\n"
+              L"A game update probably changed the code the mod relies on. Look for a newer version of GravityControl. "
+              L"Another mod that changes the same game code can cause this too.\n\n";
+        msg += L"Details are in gravitycontrol.log, next to the mod. ";
+        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), kTitle, MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
     }
     return unloadSelf();
+}
+
+// After hooking a function that another mod had hooked first: the "original" this mod calls is then that
+// mod's hook, so it starts with a jump instead of the function's own first instructions. Says so in the log.
+void logShared(int id, const void* orig) {
+    const Anchor& a = g_anchors[id];
+    uintptr_t next = 0;
+    if (orig && jumpAt((const uint8_t*)orig, next)) logf("hook %s is shared: this mod runs first, then %s", a.name, hookOwner(next).c_str());
+    else if (!a.sharedWith.empty()) logf("hook %s is shared with %s", a.name, a.sharedWith.c_str());
 }
 
 DWORD WINAPI initThread(LPVOID) {
@@ -1009,7 +1132,9 @@ DWORD WINAPI initThread(LPVOID) {
     }
     for (const OtherCopy& old : copies.legacy) takeOver(old);
     retireFlatInstall();
-    if (!resolveAnchors()) return standDown("a hook point it needs was not found in this game build");
+    if (!resolveAnchors())
+        return g_otherMod ? standDown("another mod rewrote a function it needs", true)
+                          : standDown("a hook point it needs was not found in this game build");
     if (MH_Initialize() != MH_OK) return standDown("the hooking library did not start");
     {
         HMODULE xi = LoadLibraryW(L"xinput1_4.dll");
@@ -1027,19 +1152,21 @@ DWORD WINAPI initThread(LPVOID) {
     if (failed) { logf("FAIL: hook %s", failed); MH_Uninitialize(); return standDown("a hook could not be created"); }
     bool menuHook = g_anchors[A_MENU].found &&
                     MH_CreateHook((void*)g_anchors[A_MENU].found, (void*)hkMenu, (void**)&g_origMenu) == MH_OK;   // optional
+    logShared(A_START, (const void*)g_origStart); logShared(A_MPI, (const void*)g_origBody); logShared(A_UAA, (const void*)g_origUaa);
+    if (menuHook) logShared(A_MENU, (const void*)g_origMenu);
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
         // some hooks may already be live, so this copy stays loaded
         logf("FAIL: enable hooks; GravityControl may not work in this session");
         if (g_cfg.versionWarning && dialogs())
             MessageBoxW(nullptr, (std::wstring(L"GravityControl could not switch its hooks on in this version of the game and may not work.\n\n"
                                                L"Details are in gravitycontrol.log, next to the mod. ") + kStopMessage).c_str(),
-                        L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+                        kTitle, MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
         return 0;
     }
     CreateThread(nullptr, 0, hidThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, xinputThread, nullptr, 0, nullptr);
-    logf("active: GravityControl 1.2 - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
-         g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0);
+    logf("active: GravityControl %s - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
+         kVersion, g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0);
     // Parts that had to be left out in this game build. Only the ones a player would notice get a message.
     std::wstring off;
     if (!g_isUnlocked) {
@@ -1056,7 +1183,7 @@ DWORD WINAPI initThread(LPVOID) {
     else if (g_cfg.versionWarning && dialogs()) {
         std::wstring msg = L"GravityControl is running, but this version of the game changed some of the code it relies on. Switched off:\n\n" + off +
                            L"\nEverything else works. Look for a newer version of GravityControl.\n\n";
-        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), L"GravityControl", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+        MessageBoxW(nullptr, (msg + kStopMessage).c_str(), kTitle, MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
     }
     return 0;
 }
@@ -1160,7 +1287,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_logLock);
         g_t0 = GetTickCount();
         g_log = _wfsopen((g_dir + L"gravitycontrol.log").c_str(), L"w", _SH_DENYWR);   // readable while the game runs
-        logf("GravityControl 1.2 loading from %ls", g_dir.c_str());
+        logf("GravityControl %s loading from %ls", kVersion, g_dir.c_str());
         CreateThread(nullptr, 0, initThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         logf(reserved ? "game exiting" : "unloaded");

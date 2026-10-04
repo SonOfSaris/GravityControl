@@ -1,6 +1,12 @@
 GravityControl changelog
 ========================
 
+1.2.1 Works next to other mods that hook the same game functions. 1.2 did not recognise a function
+      that another mod had hooked first, took that for a game update and switched itself off
+      (reported on game 1.4.1 by players who also run Gameplay Tweaks). Such a function is now
+      found behind the other mod's hook and both hooks run; the log names the other mod.
+      The message at start shows the mod version and mentions other mods as a possible cause.
+      Game 1.4.1 is listed as a known build (1.2 already ran on it).
 1.2   Works on the game update of 1 October 2026 (1.1 went inactive there: the game's unlock check was
       rebuilt and one lookup pattern no longer matched). Build 25472515 is still supported.
       Game updates: no message any more just because the build is different. A message appears

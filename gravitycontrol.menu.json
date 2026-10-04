@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "gravitycontrol",
   "name": "GravityControl",
-  "version": "1.2",
+  "version": "1.2.1",
   "dll": "gravitycontrol.dll",
   "options": [
     {"id": "enabled", "type": "toggle", "default": true,

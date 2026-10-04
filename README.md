@@ -21,9 +21,9 @@ the `winmm.dll` mod loader, which you already have if you run other DLL mods. Fu
 Upgrading from 1.0: just extract. On its first start the mod takes over from the old flat files in
 `crmods\` and renames them with `.old` on the end. Nothing is deleted.
 
-Checked on Steam build 25472515 and on the game update of 1 October 2026. After a later update the
+Checked on Steam build 25472515 and on game versions 1.4.0 and 1.4.1. After a later update the
 mod still runs if the code it needs is unchanged. It shows a message only when an update stops the
-mod, or part of it, from working.
+mod, or part of it, from working. It works next to other mods that hook the same game functions.
 
 ## Build
 
@@ -47,7 +47,8 @@ and re-posing the character controller. GravityControl hooks that pipeline and f
 its own: a sweep with the engine's own query helper finds the surface, its normal becomes the new
 "up" (snapped to a world axis), and the game's interpolation, camera and capsule fix-up run exactly
 as inside an anomaly. Hook points are found by byte pattern in the game executable at start; if a
-game update moves them beyond recognition the mod stays inactive and says so.
+game update moves them beyond recognition the mod stays inactive and says so. A function another mod
+hooked first is found behind that hook, and both hooks run.
 
 ## Credits
 
