@@ -1,4 +1,4 @@
-GravityControl 1.2.2 - arbitrary gravity direction for CONTROL Resonant
+GravityControl 1.3.1 - arbitrary gravity direction for CONTROL Resonant
 =======================================================================
 
 Allows free use of the Gravity Anomaly ability on-demand after acquiring it,
@@ -32,6 +32,8 @@ CONTROLS
   Shift   tap Right Shift or d-pad up
   Reset   hold Right Shift or d-pad up for one second
   Both can be changed under Options > MODS or in gravitycontrol_config.ini.
+  Chorded activation (off by default): hold LB / L1 and tap X / Square, or hold Shift and tap V,
+  instead of the single key and button. Switch it on and change the four inputs in the same places.
   Xbox, DualSense and DualShock 4 controllers work, with or without Steam Input.
 
 HOW IT PLAYS
@@ -39,8 +41,9 @@ HOW IT PLAYS
   it, so you land on the wall you face or flip onto the ceiling above you. With nothing there, it
   probes past the edge in front of you, or simply turns gravity to your facing (roll forward over
   an edge you just crested). The new "up" is always a world axis.
-  Reset returns to normal gravity. Dying resets it too. Walking into one of the game's own anomaly
-  walls hands control to the game; leaving it returns to normal as usual.
+  Reset returns to normal gravity. Dying resets it too. The game's own anomaly surfaces and Reach
+  points keep working while gravity is shifted: a transition the game starts takes over, and a
+  shift tapped while it is still running is skipped.
   The keys do nothing while a game menu is open, and nothing at all until the save has the
   Gravity Anomaly ability.
 

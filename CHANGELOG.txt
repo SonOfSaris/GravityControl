@@ -1,6 +1,19 @@
 GravityControl changelog
 ========================
 
+1.3.1 The game's own transitions win. A transition the game starts while gravity is shifted now
+      always takes over, including one back to normal gravity (a surface on the floor plane, a
+      Reach point): those were dropped before, so the game's button did nothing. A shift tapped
+      while a game transition is still running is skipped instead of redirecting it half way;
+      with the LB + X chord, LB is also the game's anomaly button, so on one of its surfaces the
+      game answers first. The log now traces every game transition until it ends.
+1.3   Chorded activation (off by default): shift gravity with two inputs together instead of one.
+      Hold the modifier, then tap the key or button; hold both to reset. Defaults: LB / L1 + X /
+      Square on a controller, either Shift + V on the keyboard. All four can be changed under
+      Options > MODS or in the ini ([Chord]). While it is on, the single key and button are not
+      used. The key may land up to 150 ms before the modifier and still count; a key held for
+      longer does not trigger when the modifier arrives, so on its own each input stays the
+      game's.
 1.2.2 The message at start explains itself: mod version, game version (with the exe's file version),
       game build date, which game function failed and the likely cause. On a game version the mod
       supports, it points at other mods instead of a game update. It ends with what to include in

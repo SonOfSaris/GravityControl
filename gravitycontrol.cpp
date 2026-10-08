@@ -1,4 +1,4 @@
-// GravityControl 1.2.2 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515 up to game version 1.4.1).
+// GravityControl 1.3.1 - arbitrary gravity direction for CONTROL Resonant (Steam build 25472515 up to game version 1.4.1).
 //
 // How it works (see _modding-research/NOTES.md):
 //   The player's "down" is the quaternion in coregame::component::MovementPlane. The game's own
@@ -8,8 +8,8 @@
 //   a sweep along the player's facing: hit -> new up = hit normal (rotate back onto the wall you
 //   face); no hit -> new up = facing (rotate forward over the edge you just crested).
 //   Row pointers come from two per-entity system bodies we hook (movement_plane_interpolation and
-//   update_active_anomaly); the start helper is hooked too, so the game's own calls can be held
-//   off while we own the plane.
+//   update_active_anomaly); the start helper is hooked too, so a transition the game starts itself
+//   (its anomaly surfaces, Reach points, respawns) takes the plane back from us.
 //
 // Loads through crloader (crmods\GravityControl\gravitycontrol.dll). Next to the DLL: the settings in
 // gravitycontrol_config.ini, the log in gravitycontrol.log, and gravitycontrol.menu.json, which puts the
@@ -31,11 +31,12 @@
 #include <tlhelp32.h>
 #include "MinHook.h"
 #include "sonypad.h"
+#include "chord.h"
 
 namespace {
 
 #ifndef GC_VERSION
-#define GC_VERSION "1.2.2"
+#define GC_VERSION "1.3.1"
 #endif
 #define GC_WIDE2(x) L##x
 #define GC_WIDE(x) GC_WIDE2(x)
@@ -100,6 +101,10 @@ struct Settings {
     int padEnabled = 1;
     int padButton = XINPUT_GAMEPAD_DPAD_UP;   // XInput wButtons mask; 0x10000 = LT / L2, 0x20000 = RT / R2; 0 = none
     float padHoldSeconds = 1.f;
+    // chorded activation: a modifier held while the key or button is pressed; replaces the single key and button
+    int chord = 0;
+    int chordKey = 'V', chordMod = VK_SHIFT;                    // VK_SHIFT = either Shift key; 0 = no modifier
+    int chordButton = XINPUT_GAMEPAD_X, chordModButton = XINPUT_GAMEPAD_LEFT_SHOULDER;     // masks like padButton
     // blockers: collision-matrix bits (PlayerLayer, L) cleared so the player's capsule ignores layer L
     int ignoreLayers[8] = {}; int nIgnore = 0;
 } g_cfg;
@@ -179,6 +184,11 @@ int applyMenu(Settings& c) {
     if (menuNum(L"key", v, f))                { int k = (int)v; if (k == 0 || (k >= 3 && k <= 254)) { c.keyShift = k; n++; } }
     if (menuNum(L"pad_button", v, f))         { int k = (int)v; if (k == 0) { c.padButton = 0; n++; } else if (k >= 256 && k < 272) { c.padButton = (int)kMenuPad[k - 256]; n++; } }
     if (menuNum(L"hold_ms", v, f))            { c.keyHoldSeconds = c.padHoldSeconds = clampf(v, 100, 5000) / 1000.f; n++; }
+    if (menuNum(L"chord", v, f))              { c.chord = v != 0; n++; }
+    if (menuNum(L"chord_key", v, f))          { int k = (int)v; if (k == 0 || (k >= 3 && k <= 254)) { c.chordKey = k; n++; } }
+    if (menuNum(L"chord_mod_key", v, f))      { int k = (int)v; if (k == 0 || (k >= 3 && k <= 254)) { c.chordMod = k; n++; } }
+    if (menuNum(L"chord_button", v, f))       { int k = (int)v; if (k == 0) { c.chordButton = 0; n++; } else if (k >= 256 && k < 272) { c.chordButton = (int)kMenuPad[k - 256]; n++; } }
+    if (menuNum(L"chord_mod_button", v, f))   { int k = (int)v; if (k == 0) { c.chordModButton = 0; n++; } else if (k >= 256 && k < 272) { c.chordModButton = (int)kMenuPad[k - 256]; n++; } }
     if (menuNum(L"ray_length", v, f))         { c.rayLength = clampf(v, 1, 100); n++; }
     if (menuNum(L"axis_only", v, f))          { c.axisOnly = v != 0; n++; }
     if (menuNum(L"require_unlock", v, f))     { c.requireUnlock = v != 0; n++; }
@@ -211,6 +221,11 @@ void loadSettings() {
     c.padEnabled = iniInt(L"Controller", L"Enabled", c.padEnabled, f);
     c.padButton  = iniInt(L"Controller", L"Button", c.padButton, f);
     c.padHoldSeconds = iniFloat(L"Controller", L"HoldSeconds", c.padHoldSeconds, f);
+    c.chord      = iniInt(L"Chord", L"Enabled", c.chord, f);
+    c.chordKey   = iniInt(L"Chord", L"Key", c.chordKey, f);
+    c.chordMod   = iniInt(L"Chord", L"Modifier", c.chordMod, f);
+    c.chordButton = iniInt(L"Chord", L"Button", c.chordButton, f);
+    c.chordModButton = iniInt(L"Chord", L"ModifierButton", c.chordModButton, f);
     iniList(L"Blockers", L"IgnoreLayers", c.ignoreLayers, c.nIgnore, 8, f);
     g_menuValues = applyMenu(c);
     g_cfg = c;
@@ -220,6 +235,8 @@ void logSettings() {
     logf("settings: Enabled=%d Key=0x%X PadButton=0x%X Hold=%.1f/%.1f Length=%.1f Radius=%.2f AxisOnly=%d RequireUnlock=%d Diag=%d (%d from the MODS menu)",
          g_cfg.enabled, g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0, g_cfg.keyHoldSeconds, g_cfg.padHoldSeconds,
          g_cfg.rayLength, g_cfg.rayRadius, g_cfg.axisOnly, g_cfg.requireUnlock, g_cfg.diagnostics, g_menuValues);
+    if (g_cfg.chord) logf("chorded activation on: keys 0x%X + 0x%X, pad buttons 0x%X + 0x%X (modifier first); the single key and button are not used",
+                          g_cfg.chordMod, g_cfg.chordKey, g_cfg.padEnabled ? g_cfg.chordModButton : 0, g_cfg.padEnabled ? g_cfg.chordButton : 0);
     if (g_cfg.nIgnore) logf("blockers: IgnoreLayers count=%d (player layer %d)", g_cfg.nIgnore, kPlayerLayer);
 }
 
@@ -302,17 +319,22 @@ std::atomic<bool> g_yielded{ false };        // a newer copy took over: the hook
 
 // ---------------------------------------------------------------- state (game thread only)
 struct State {
-    bool engaged = false;      // we own the plane; the game's start calls are dropped
+    bool engaged = false;      // we own the plane, until the game starts a transition of its own
     bool releasing = false;    // reset transition in flight
     int traceFrames = 0;       // log the next N body calls in detail
+    bool traceToEnd = false;   // keep tracing while a transition is pending or active (a game-started one)
+    int traceCap = 0;          // ... for at most this many more frames
+    DWORD gameStartTick = 0;   // when the game last started a transition through the hooked helper
+    bool gameStartSeen = false;
     Quat ourTarget{ 0, 0, 0, 1 };
     // rows captured from update_active_anomaly's view
     uint8_t* cam = nullptr; uint8_t* pad = nullptr; uint8_t* rules = nullptr; int64_t uaaIdx = -1;
     void* worldDb = nullptr; void* abilityDb = nullptr; DWORD uaaTick = 0;   // env pointers seen by update_active_anomaly
     uint8_t* menuState = nullptr; DWORD menuTick = 0; int menuOpenLast = -1; DWORD menuIgnoreLog = 0;
-    unsigned startCalls = 0, bodyCalls = 0, uaaCalls = 0, dropped = 0;
+    unsigned startCalls = 0, bodyCalls = 0, uaaCalls = 0;
     bool keyShiftDown = false, keyConsumed = false; DWORD keyDownAt = 0;
     bool padDown = false, padConsumed = false; DWORD padDownAt = 0;
+    chord::State keyChord, padChord;
     DWORD lastCfgCheck = 0; FILETIME cfgTime{}, menuCfgTime{}; int enabledLast = -1;
 } g_s;
 
@@ -335,19 +357,19 @@ void hkStart(const Quat* target, uint64_t entity, float duration, uint8_t linear
         // An instant snap from the game (fall respawn, teleport, game-flow transition): it must win, and it
         // ends our ownership of the plane. Reset still works afterwards if the plane is left turned.
         g_s.engaged = false; g_s.releasing = false;
-        logf("game snapped the plane (respawn/teleport): releasing it (dropped %u default-plane calls while engaged)", g_s.dropped);
-        g_s.dropped = 0;
+        logf("game snapped the plane (respawn/teleport): releasing it");
     } else if (g_s.engaged && !sameQuat(*target, g_s.ourTarget)) {
-        if (!sameQuat(*target, kIdentity)) {
-            // The game wants a real anomaly's plane (the player entered one): hand the plane back and let
-            // its own animated transition run. Leaving the anomaly then returns to normal gravity as usual.
-            g_s.engaged = false; g_s.releasing = false;
-            logf("handing the plane to the game's anomaly (dropped %u default-plane calls while engaged)", g_s.dropped);
-            g_s.dropped = 0;
-        } else {
-            g_s.dropped++; return;   // the game's "back to default" while we own the plane
-        }
+        // The game wants one of its own planes: an anomaly surface the player chose with the game's own
+        // button, a Reach point that sets gravity, or normal gravity again. Hand the plane back and let its
+        // animated transition run. Nothing is dropped: this build starts a transition only when its anomaly
+        // state changes (a few hundred calls in hours of play), so there is no per-frame undo to hold off.
+        g_s.engaged = false; g_s.releasing = false;
+        logf("handing the plane to the game (%s)", sameQuat(*target, kIdentity) ? "back to normal gravity" : "one of its anomalies");
     }
+    g_s.releasing = false;   // a reset of ours still in flight is now the game's transition
+    // Trace how the game's transition goes, hand-over or not, until it has ended.
+    g_s.gameStartTick = GetTickCount(); g_s.gameStartSeen = true;
+    g_s.traceFrames = 8; g_s.traceToEnd = true; g_s.traceCap = 150;
     g_origStart(target, entity, duration, linear, pac, plane, mpi, cam);
 }
 
@@ -629,8 +651,7 @@ void requestReset(uint8_t (*b)[32]) {
     Quat* plane = (Quat*)(*(uint8_t**)(b[0] + 16) + idx * 0x10);
     uint8_t* mpi = *(uint8_t**)(b[1] + 0) + idx * 0x50;
     void* pac = *(uint8_t**)(b[2] + 16) + idx * 0xf0;
-    logf("reset: back to normal gravity (dropped %u game calls while engaged)", g_s.dropped);
-    g_s.dropped = 0;
+    logf("reset: back to normal gravity");
     g_s.engaged = false;
     g_s.releasing = true;
     applyTarget(kIdentity, pac, plane, mpi, "reset");
@@ -693,6 +714,7 @@ void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p
         // Switched off: give the plane back to the game and forget half-pressed inputs.
         if (g_s.engaged) { logf("disabled while shifted: returning to normal gravity"); requestReset(blocks); }
         g_s.keyShiftDown = g_s.padDown = false;
+        g_s.keyChord = g_s.padChord = chord::State();
     }
     if (g_s.engaged || g_s.releasing) {
         // The interpolation waits for the game's transition animation while MPI+0x48 is set; we play no
@@ -711,23 +733,34 @@ void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p
     if (g_cfg.enabled && gameHasFocus()) {
         bool doShift = false, doReset = false;
         DWORD know = GetTickCount();
-        bool shift = g_cfg.keyShift && (GetAsyncKeyState(g_cfg.keyShift) & 0x8000) != 0;
+        // Keyboard: one key, or with chorded activation a modifier held while the key is pressed (chord.h).
+        bool shift;
+        if (g_cfg.chord) {
+            bool mod = !g_cfg.chordMod || (GetAsyncKeyState(g_cfg.chordMod) & 0x8000) != 0;       // no modifier set: the key alone
+            bool key = g_cfg.chordKey && (GetAsyncKeyState(g_cfg.chordKey) & 0x8000) != 0;
+            shift = chord::down(g_s.keyChord, mod, key, know);
+        } else shift = g_cfg.keyShift && (GetAsyncKeyState(g_cfg.keyShift) & 0x8000) != 0;
+        const char* keyName = g_cfg.chord ? "key chord" : "key";
         if (shift && !g_s.keyShiftDown) { g_s.keyDownAt = know; g_s.keyConsumed = false; }
         if (shift && g_s.keyShiftDown && !g_s.keyConsumed && know - g_s.keyDownAt >= (DWORD)(g_cfg.keyHoldSeconds * 1000.f)) {
-            g_s.keyConsumed = true; doReset = true; logf("key: hold -> reset");
+            g_s.keyConsumed = true; doReset = true; logf("%s: hold -> reset", keyName);
         }
-        if (!shift && g_s.keyShiftDown && !g_s.keyConsumed) { doShift = true; logf("key: tap -> shift"); }
+        if (!shift && g_s.keyShiftDown && !g_s.keyConsumed) { doShift = true; logf("%s: tap -> shift", keyName); }
         g_s.keyShiftDown = shift;
         // Controller: tap = shift, hold for HoldSeconds = reset. XInput pads and PlayStation pads read over
         // HID feed one button mask, so a pad that shows up both ways (Steam Input) still counts once.
-        if (g_cfg.padEnabled && g_cfg.padButton) {
+        // With chorded activation the button counts while the modifier button is held, like the keys.
+        uint32_t padMain = (uint32_t)(g_cfg.chord ? g_cfg.chordButton : g_cfg.padButton);
+        if (g_cfg.padEnabled && padMain) {
             uint32_t buttons = xinputButtons() | g_hidButtons.load(std::memory_order_relaxed);
-            bool down = (buttons & (uint32_t)g_cfg.padButton) != 0;
+            bool down = (buttons & padMain) != 0;
+            if (g_cfg.chord) down = chord::down(g_s.padChord, !g_cfg.chordModButton || (buttons & (uint32_t)g_cfg.chordModButton) != 0, down, know);
+            const char* padName = g_cfg.chord ? "pad chord" : "pad";
             if (down && !g_s.padDown) { g_s.padDownAt = know; g_s.padConsumed = false; }
             if (down && g_s.padDown && !g_s.padConsumed && know - g_s.padDownAt >= (DWORD)(g_cfg.padHoldSeconds * 1000.f)) {
-                g_s.padConsumed = true; doReset = true; logf("pad: hold -> reset");
+                g_s.padConsumed = true; doReset = true; logf("%s: hold -> reset", padName);
             }
-            if (!down && g_s.padDown && !g_s.padConsumed) { doShift = true; logf("pad: tap -> shift"); }
+            if (!down && g_s.padDown && !g_s.padConsumed) { doShift = true; logf("%s: tap -> shift", padName); }
             g_s.padDown = down;
         } else g_s.padDown = false;
         if ((doShift || doReset) && menuOpen() == 1) {
@@ -736,8 +769,16 @@ void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p
             doShift = doReset = false;
         }
         if (doShift) {
+            // A transition the game started (its anomaly button, a Reach point) is still running: leave it
+            // alone instead of redirecting it half way. With the LB + X chord, LB is also the game's anomaly
+            // button, so on one of its surfaces the game answers first and this tap is the same press.
+            int64_t sidx = *(int64_t*)(blocks[3] + 8);
+            uint8_t* smpi = *(uint8_t**)(blocks[1] + 0) + sidx * 0x50;
+            bool gameRunning = !g_s.engaged && (smpi[0x4b] || smpi[0x49]) && g_s.gameStartSeen && know - g_s.gameStartTick <= 2000;
             void* scene = scenePtr ? *scenePtr : nullptr;
-            if (scene && g_sweep) requestShift(blocks, scene);
+            if (gameRunning) logf("shift skipped: the game's own transition from %u ms ago is still running (pending=%d active=%d wait=%d)",
+                                  know - g_s.gameStartTick, smpi[0x4b], smpi[0x49], smpi[0x48]);
+            else if (scene && g_sweep) requestShift(blocks, scene);
             else logf("shift: no physics scene captured yet");
         }
         if (doReset) {
@@ -773,6 +814,11 @@ void hkBody(uint8_t (*blocks)[32], void* p2, void** scenePtr, float* dt, void* p
         logf("trace: exit body pending=%d active=%d elapsed=%.3f duration=%.3f plane (%.3f %.3f %.3f %.3f)",
              mpi[0x4b], mpi[0x49], *(float*)(mpi + 0x38), *(float*)(mpi + 0x3c), plane->x, plane->y, plane->z, plane->w);
         g_s.traceFrames--;
+        if (g_s.traceToEnd) {
+            // a game-started transition: follow it (through its animation wait) until two frames after it ends
+            if ((mpi[0x4b] || mpi[0x49]) && g_s.traceFrames < 3) g_s.traceFrames = 3;
+            if (--g_s.traceCap <= 0 || g_s.traceFrames <= 0) { g_s.traceToEnd = false; if (g_s.traceCap <= 0) logf("trace: stopped (cap)"); }
+        }
         return;
     }
     g_origBody(blocks, p2, scenePtr, dt, p5);
@@ -1278,7 +1324,7 @@ DWORD unloadSelf() {
     return 0;
 }
 
-bool padWanted() { return g_cfg.enabled && g_cfg.padEnabled && g_cfg.padButton && !g_yielded; }
+bool padWanted() { return g_cfg.enabled && g_cfg.padEnabled && (g_cfg.chord ? g_cfg.chordButton : g_cfg.padButton) && !g_yielded; }
 bool padVerbose() { return g_cfg.diagnostics != 0; }
 DWORD WINAPI hidThread(LPVOID) { sonypad::run(g_hidButtons, padWanted, padVerbose, logf); return 0; }
 DWORD WINAPI xinputThread(LPVOID) {
@@ -1485,8 +1531,12 @@ DWORD WINAPI initThread(LPVOID) {
     }
     CreateThread(nullptr, 0, hidThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, xinputThread, nullptr, 0, nullptr);
-    logf("active: GravityControl %s - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
-         kVersion, g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0);
+    if (g_cfg.chord)
+        logf("active: GravityControl %s - hold the modifier and tap the key (0x%X + 0x%X) or the pad button (masks 0x%X + 0x%X) to shift gravity, hold both to reset",
+             kVersion, g_cfg.chordMod, g_cfg.chordKey, g_cfg.padEnabled ? g_cfg.chordModButton : 0, g_cfg.padEnabled ? g_cfg.chordButton : 0);
+    else
+        logf("active: GravityControl %s - tap the key (0x%X) or the pad button (mask 0x%X) to shift gravity, hold it to reset",
+             kVersion, g_cfg.keyShift, g_cfg.padEnabled ? g_cfg.padButton : 0);
     // Parts that had to be left out here. Only the ones a player would notice get a message.
     std::wstring off;
     if (!g_isUnlocked) {

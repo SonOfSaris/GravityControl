@@ -7,6 +7,8 @@ and the collision fix-up are the game's own.
 
 - **Shift**: tap Right Shift or d-pad up. The closer surface ahead or above wins.
 - **Reset**: hold the same key or button for a second.
+- **Chorded activation** (optional, off by default): hold LB and tap X, or hold Shift and tap V. All
+  four inputs can be changed.
 - Needs the Gravity Anomaly ability unlocked in your save. Does nothing while a menu is open.
 - Xbox, DualSense and DualShock 4 controllers work.
 - With Mod Settings Menu installed, every setting is under Options > MODS, with an Enable switch.
@@ -41,6 +43,8 @@ into `out\gravitycontrol.dll`. Copy the DLL, `gravitycontrol_config.ini` and
 
 `tests\build_padtest.bat` builds `out\padtest.exe`, which checks the PlayStation controller report
 layouts in `sonypad.h` and prints the buttons it reads from a connected pad.
+`tests\build_chordtest.bat` builds `out\chordtest.exe`, which checks the timing rules of chorded
+activation in `chord.h`.
 
 ## How it works
 
@@ -48,7 +52,9 @@ The game turns gravity for its anomaly walls by slerping the player's `MovementP
 and re-posing the character controller. GravityControl hooks that pipeline and feeds it a target of
 its own: a sweep with the engine's own query helper finds the surface, its normal becomes the new
 "up" (snapped to a world axis), and the game's interpolation, camera and capsule fix-up run exactly
-as inside an anomaly. Hook points are found by byte pattern in the game executable at start; if a
+as inside an anomaly. A transition the game starts itself (an anomaly surface, a Reach point, a
+respawn) always takes the plane back, and a shift tapped while one is running is skipped.
+Hook points are found by byte pattern in the game executable at start; if a
 game update moves them beyond recognition the mod stays inactive and says so. A function another mod
 hooked first is found behind that hook, and both hooks run.
 
